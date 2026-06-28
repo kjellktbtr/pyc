@@ -1,0 +1,78 @@
+{
+  "project": "pyc",
+  "description": "C -> 16-bit NASM (MS-DOS) compiler summary for agentic LLMs",
+  "files": {
+    "md": "docs/agentic-llm-summary.md",
+    "json": "docs/agentic-llm-summary.json"
+  },
+  "target": {
+    "os": "msdos",
+    "bits": 16,
+    "assembler": "nasm",
+    "linker": "alink",
+    "nasm_cmd": "nasm -f obj -o {out} {asm}",
+    "alink_note": "avoid interactive help; use printf \"\\n\\n\" | alink"
+  },
+  "types": {
+    "char": 1,
+    "short": 2,
+    "int": 2,
+    "long": 4,
+    "pointer": 2,
+    "float": 4,
+    "double": 8
+  },
+  "calling_convention": {
+    "arg_order": "right-to-left",
+    "stack_cleanup": "caller",
+    "return_reg": "ax"
+  },
+  "features": [
+    {
+      "name": "basic_types",
+      "priority": "MUST",
+      "parser": "src/pyc/parser.py",
+      "ast": "src/pyc/ast.py",
+      "codegen": "src/pyc/codegen.py"
+    },
+    {
+      "name": "control_flow",
+      "priority": "MUST",
+      "parser": "src/pyc/parser.py",
+      "codegen": "src/pyc/codegen.py"
+    },
+    {
+      "name": "functions_and_calls",
+      "priority": "MUST",
+      "parser": "src/pyc/parser.py",
+      "codegen": "src/pyc/codegen.py"
+    },
+    {
+      "name": "structs",
+      "priority": "SHOULD",
+      "parser": "src/pyc/parser.py",
+      "types": "src/pyc/types.py",
+      "codegen": "src/pyc/codegen.py"
+    }
+  ],
+  "templates": {
+    "func_prologue": "push bp\\nmov bp, sp\\npush bx\\npush cx\\npush dx\\npush si\\npush di",
+    "call_cleanup": "push args (R->L)\\ncall {sym}\\nadd sp, {args_bytes}",
+    "local_alloc": "sub sp, {local_bytes}\\n; locals at [bp - offset]",
+    "str_literal": "section .data\\n._str_{n} db ... ,0"
+  },
+  "tests": [
+    {
+      "name": "smoke_return_42",
+      "source": "int main(){ return 42; }",
+      "expect": "mov ax, 42"
+    }
+  ],
+  "next_steps": [
+    "stabilize preprocessor",
+    "add semantic pass to annotate AST with CType",
+    "fix pointer arithmetic scaling",
+    "use StructType offsets in codegen",
+    "add indirect call support"
+  ]
+}

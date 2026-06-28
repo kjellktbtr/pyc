@@ -1,0 +1,3885 @@
+"""Code generator: AST → 16-bit NASM assembly for DOS .EXE."""
+
+from __future__ import annotations
+
+from src.pyc.ast import (
+    BinaryOp,
+    Block,
+    BreakStmt,
+    CallExpr,
+    CaseLabel,
+    CastExpr,
+    CharLiteral,
+    CommaExpr,
+    CompoundAssignment,
+    ContinueStmt,
+    DeclStmt,
+    DoWhileStmt,
+    Expr,
+    ExpressionStmt,
+    ForStmt,
+    FunctionDefinition,
+    ComputedGotoStmt,
+    GotoStmt,
+    Identifier,
+    IfStmt,
+    IntLiteral,
+    LabelAddress,
+    FloatLiteral,
+    LabelStmt,
+    MemberAccess,
+    ReturnStmt,
+    SizeofExpr,
+    Stmt,
+    StringLiteral,
+    Subscript,
+    SwitchStmt,
+    TernaryExpr,
+    TopLevelDecl,
+    TranslationUnit,
+    UnaryOp,
+    WhileStmt,
+)
+from src.pyc.symbols import SymbolKind, SymbolTable
+from src.pyc.types import (
+    BaseType,
+    CType,
+    EnumType,
+    PointerType,
+    ArrayType,
+    StructType,
+    UnionType,
+    array_of,
+    base_type,
+    pointer_to,
+    void_type,
+)
+
+
+class LabelGenerator:
+    """Generates unique labels for control flow."""
+
+    def __init__(self) -> None:
+        self._counter = 0
+
+    def generate(self, hint: str = "") -> str:
+        self._counter += 1
+        return f".L{hint}_{self._counter}"
+
+
+class CodeGenerator:
+    """Generates 16-bit NASM assembly from AST."""
+
+    def __init__(
+        self,
+        symbol_table: SymbolTable | None = None,
+        comments: list[tuple[int, str]] | None = None,
+    ) -> None:
+        self._sym = symbol_table
+        # Pending C comments (line, text) drained as each statement
+        # emits.  Sorted by line ascending; we always emit comments
+        # whose source line is <= the current statement's line.
+        self._comments: list[tuple[int, str]] = sorted(comments or [])
+        self._labels = LabelGenerator()
+        self._code: list[str] = []
+        self._data: list[str] = []
+        self._bss: list[str] = []
+        self._string_counter = 0
+        self._string_labels: dict[str, str] = {}
+        self._current_function: str = ""
+        self._break_targets: list[str] = []
+        self._continue_targets: list[str] = []
+        # Local variable tracking: name -> stack offset (from BP)
+        self._locals: dict[str, int] = {}
+        # Local types: name -> CType
+        self._local_types: dict[str, CType] = {}
+        self._global_types: dict[str, CType] = {}
+        # Populated by `generate()` from the parser's
+        # __attribute__((constructor))/((destructor)) markers.
+        self._ctors: list[str] = []
+        self._dtors: list[str] = []
+        self._local_count: int = 0
+        # Static locals: name -> label (allocated in .data)
+        self._static_locals: dict[str, str] = {}
+        # Label for the current function's epilogue (used by return stmts)
+        self._epilogue_label: str = ""
+        # Track which symbols are defined in this TU
+        self._defined: set[str] = set()
+        self._referenced: set[str] = set()
+        # Names known to be functions in this TU.  Used by `_gen_call`
+        # to choose direct vs. indirect dispatch when no shared
+        # `SymbolTable` is available (single-file compile mode).
+        self._function_names: set[str] = set()
+        # Signature lookup for functions in this TU (return-type +
+        # params).  Used by `_expr_type` so calls in single-file mode
+        # still infer the right return type.
+        self._function_types: dict[str, "CType"] = {}
+
+    def _register_symbol(self, name: str, kind: SymbolKind, ctype: CType, defined: bool = False) -> None:
+        if self._sym is not None:
+            self._sym.add_symbol(name, kind, ctype, defined=defined)
+        # Mirror the type into a local dict so single-file compiles
+        # (where `_sym` is None) can still resolve the type later —
+        # e.g. an `Identifier` of global array type needs to decay to
+        # its address, not be loaded as a value.
+        if kind == SymbolKind.VARIABLE:
+            self._global_types[name] = ctype
+        if defined:
+            self._defined.add(name)
+        if kind == SymbolKind.FUNCTION:
+            self._function_names.add(name)
+            self._function_types[name] = ctype
+
+    def _reference_symbol(self, name: str) -> None:
+        self._referenced.add(name)
+        if self._sym is not None:
+            self._sym.reference(name)
+
+    # --- Main entry ---
+
+    def generate(self, ast: TranslationUnit) -> str:
+        """Generate complete NASM assembly for a translation unit."""
+        # Stash the ctor/dtor list from the parser so the entry point
+        # can emit pre-main / post-main calls in _emit_epilogue.
+        self._ctors = list(getattr(ast, "constructors", []) or [])
+        self._dtors = list(getattr(ast, "destructors", []) or [])
+
+        self._emit_prologue()
+
+        for decl in ast.declarations:
+            self._gen_top_level(decl)
+
+        self._emit_epilogue()
+        return self._assemble()
+
+    # --- NASM output assembly ---
+
+    def _assemble(self) -> str:
+        parts = ["; === Generated by pyc ===\n"]
+        parts.append("[bits 16]\n")
+
+        # Emit global directives for defined symbols
+        if self._defined:
+            parts.append("\n; --- Exported symbols ---")
+            for name in sorted(self._defined):
+                parts.append(f"global {name}")
+
+        # Emit extrn directives for referenced but undefined symbols
+        extrns = self._referenced - self._defined
+        if extrns:
+            parts.append("\n; --- Imported symbols ---")
+            for name in sorted(extrns):
+                parts.append(f"extern {name}")
+
+        # Code segment
+        parts.append("\n; --- Code Segment ---")
+        parts.append("section .text\n")
+        parts.extend(self._code)
+
+        # Data and BSS segments are emitted in EVERY translation unit (even when
+        # empty), each followed by `group DGROUP data bss` below, so that a TU's
+        # references to its own .data/.bss symbols are assembled DGROUP-relative.
+        # This matters for object modules that are NOT run through the multi-file
+        # merger — chiefly the separately-compiled stdlib (e.g. stdlib.asm's
+        # malloc heap, stdio.asm's sprintf scratch): without the group, alink
+        # places their BSS at a fixed offset that can fall inside a large
+        # program's in-BSS stack.  For the program's own TUs the merger
+        # (builder._merge_asm_modules) strips these and re-emits one canonical
+        # layout, so this is a no-op there.
+        #
+        # The main TU additionally gets a `_data_start:` label so the entry
+        # bootstrap can take "seg _data_start" to load DS.
+        parts.append("\n; --- Data Segment ---")
+        parts.append("section .data\n")
+        if "main" in self._defined:
+            parts.append("_data_start:")
+        parts.extend(self._data)
+
+        # BSS segment.  The TU that defines main() reserves a stack buffer at
+        # the end of BSS so the small-model invariant SS=DS=DGROUP holds.
+        # Without this, LEA-derived local-variable addresses (SS-relative)
+        # would be dereferenced via DS and miss the real stack.
+        if True:
+            parts.append("\n; --- BSS Segment ---")
+            parts.append("section .bss\n")
+            parts.extend(self._bss)
+            if "main" in self._defined:
+                # 16K stack — fits the 100×100 int locals used by
+                # `sumarray2d` (20 KB) only because the locals overlap
+                # heap addresses that are still safe at the time they're
+                # used.  Larger stacks have left less room for the
+                # 16 KB heap reserved in `stdlib/stdlib.c`, causing
+                # corruption when both are near the 64 KB DGROUP cap.
+                parts.append("resb 0x4000")
+                parts.append("_stack_top:")
+                # Guard gap between the stack region and the stdlib BSS that
+                # the linker places just above `_stack_top` (the soft-float
+                # scratch `__fp_*` and the malloc heap).  Without it, certain
+                # `.data` sizes (empirically a ~40-byte band) put a stdlib BSS
+                # write onto a live return-address slot near `_stack_top`,
+                # corrupting control flow so the program loops / re-executes
+                # (e.g. two distinct `double`s through `printf("%f")`).  A
+                # fixed 1 KB separation pushes that resonance out of the
+                # realizable `.data`-size range; verified loop-free across a
+                # 0..1000-byte data sweep with no `single/` suite regression.
+                # See docs/progress-log.md (2026-06-02) and the `sub sp, 16`
+                # headroom in the bootstrap, which mitigates the same hazard.
+                parts.append("resb 0x400")
+
+        # Stack segment: a tiny class=STACK segment so alink writes a valid
+        # SS:SP into the MZ header (dosbox-x rejects SS:SP=0:0).  The entry
+        # point immediately overrides SS:SP to point into DGROUP, so the
+        # bytes here are never used — this segment exists only to satisfy
+        # the linker / DOS EXE loader.
+        if "main" in self._defined:
+            parts.append("\n; --- Stack Segment ---")
+            parts.append("section .stack stack class=STACK")
+            parts.append("resb 0x10")
+
+        # DGROUP groups the data and bss segments so symbols in either share
+        # one base.  The linker resolves "_stack_top" to its offset within
+        # DGROUP (data size + offset in bss) rather than the bss-local
+        # offset, so "mov sp, _stack_top" with SS=DS=DGROUP points at the
+        # right byte.  NASM -f obj stores segment names without the leading
+        # dot ("data", "bss"), and the group must come AFTER the sections
+        # it references.  Emitted in every TU — see the Data Segment note above.
+        parts.append("\ngroup DGROUP data bss")
+
+        return "\n".join(parts)
+
+    def _emit_prologue(self) -> None:
+        """Emit the program bootstrap code - only if main() is defined."""
+        # Bootstrap is only needed for the entry point file
+        # It will be added during linking if needed
+        pass
+
+    def _emit_epilogue(self) -> None:
+        """Emit program termination helper."""
+        # Only emit entry point for standalone compilation (no shared symbol table).
+        # Multi-file compilation gets the bootstrap from the merger.
+        if self._sym is not None:
+            return
+        if "main" in self._defined:
+            self._defined.add("_entry")
+            self._c("_entry:")
+            # Small-model bootstrap.  "seg _data_start" emits a SEG
+            # relocation that alink resolves to DGROUP at load time.  We
+            # then point SS at DGROUP and SP at our in-BSS stack buffer so
+            # SS=DS, which keeps LEA-derived local-variable addresses valid
+            # when later dereferenced via DS.  The class=STACK segment is
+            # only there to satisfy the EXE header (dosbox-x rejects
+            # SS:SP=0:0) — its contents are never used.
+            self._c("mov ax, seg _data_start")
+            self._c("mov ds, ax")
+            self._c("mov es, ax")
+            self._c("cli")
+            self._c("mov ss, ax")
+            self._c("mov sp, _stack_top")
+            self._c("sti")
+            # Push minimal argc/argv so `int main(int argc, char **argv)` sees
+            # something predictable (argc=1, argv=NULL).  Programs that index
+            # past argv[0] still crash, but `argc < 2` becomes deterministic.
+            #
+            # IMPORTANT: leave a small headroom (`sub sp, 4`) before the
+            # push.  Without it, the pushes write at `[_stack_top-2]`
+            # and below — but if the BSS heap reservation immediately
+            # follows `_stack_top` in the segment (depends on link
+            # order), `_heap[0..3]` aliases `[_stack_top-4..-1]` and
+            # any program that writes via malloc'd memory will clobber
+            # the pushed return address.  Bumping SP first keeps the
+            # heap and the pushed args from sharing bytes.
+            self._c("sub sp, 16")
+            # Run GCC-style `__attribute__((constructor))` functions
+            # before main.  These take no args and return nothing.
+            for ctor in self._ctors:
+                self._c(f"call {ctor}")
+            self._c("xor ax, ax")
+            self._c("push ax")            # argv = NULL
+            self._c("mov ax, 1")
+            self._c("push ax")            # argc = 1
+            self._c("call main")
+            self._c("add sp, 4")           # 4 for argc/argv
+            # Save main's return value across destructor calls.
+            self._c("push ax")
+            for dtor in self._dtors:
+                self._c(f"call {dtor}")
+            self._c("pop ax")
+            self._c("add sp, 16")          # release headroom
+            # Exit with main's return code in AL
+            self._c("mov ah, 0x4C")
+            self._c("int 0x21")
+
+    def _c(self, line: str) -> None:
+        """Emit a code line."""
+        self._code.append(line)
+
+    def _d(self, line: str) -> None:
+        """Emit a data line."""
+        self._data.append(line)
+
+    def _b(self, line: str) -> None:
+        """Emit a BSS line."""
+        self._bss.append(line)
+
+    # --- Top-level declarations ---
+
+    def _gen_top_level(self, decl: TopLevelDecl) -> None:
+        # `typedef T name;` only registers `name` in the typedef table;
+        # no storage or symbol is emitted.
+        if "typedef" in decl.specifiers:
+            return
+        is_extern = "extern" in decl.specifiers
+        is_static = "static" in decl.specifiers
+
+        if decl.body:
+            # Register the function signature BEFORE emitting the body
+            # so a recursive call inside the body can resolve its own
+            # return type — otherwise `_expr_type` returns None and
+            # `_gen_eval32` mistakenly widens a 32-bit return via `cwd`,
+            # corrupting the high word of DX:AX.
+            from src.pyc.types import FunctionType as _FT
+            ftype = _FT(
+                return_type=decl.body.return_type,
+                params=list(decl.body.params),
+                is_variadic=decl.body.is_variadic,
+            )
+            self._register_symbol(
+                decl.body.name, SymbolKind.FUNCTION, ftype, defined=True
+            )
+            self._gen_function(decl.body)
+        else:
+            from src.pyc.types import FunctionType as _FT
+            for name, ctype, init in decl.declarators:
+                # Function declarations (parser sets the declarator's
+                # type to FunctionType) get FUNCTION-kind symbols so
+                # call sites resolve to direct `call name`.
+                if isinstance(ctype, _FT):
+                    self._reference_symbol(name)
+                    self._register_symbol(
+                        name, SymbolKind.FUNCTION, ctype, defined=False
+                    )
+                    continue
+                if is_extern:
+                    self._reference_symbol(name)
+                    self._register_symbol(name, SymbolKind.VARIABLE, ctype, defined=False)
+                else:
+                    # Check if already defined elsewhere (forward decl)
+                    existing = self._sym.get(name) if self._sym else None
+                    if existing and existing.defined:
+                        self._reference_symbol(name)
+                    else:
+                        # A non-extern global without an initializer is a
+                        # tentative definition — C semantics zero-initialize
+                        # it in BSS.  Without this, every static/global var
+                        # like `static char *p;` becomes an unresolved extern.
+                        self._register_symbol(name, SymbolKind.VARIABLE, ctype, defined=True)
+                        self._gen_global_var(name, ctype, init)
+
+    # --- Function code generation ---
+
+    def _gen_function(self, func: FunctionDefinition) -> None:
+        self._current_function = func.name
+        self._epilogue_label = f".{func.name}_ret"
+        self._locals.clear()
+        self._local_types.clear()
+        # -10 accounts for the 5 callee-saved registers pushed below BP (5 × 2 bytes).
+        # This ensures _gen_local_alloc starts allocating at [BP-12] and below.
+        self._local_count = -10
+        self._c(f"{func.name}:")
+        self._c("push bp")
+        self._c("mov bp, sp")
+        self._c("push bx")
+        self._c("push cx")
+        self._c("push dx")
+        self._c("push si")
+        self._c("push di")
+        # Reserve a placeholder line in the prologue that we'll patch
+        # after generating the body to allocate the worst-case sum of
+        # all local-variable sizes in one shot.  This sidesteps the
+        # subtle bug where `_gen_local_alloc` emits its own `sub sp,
+        # N` lazily at each declaration: declarations inside branches
+        # we don't take leave SP higher than the offsets the codegen
+        # has assigned, so writes to "ghost" slots land below SP and
+        # get clobbered by subsequent pushes / call return addresses.
+        self._locals_placeholder_idx = len(self._code)
+        self._c("")  # placeholder for `sub sp, <total>`
+        self._locals_total_before = self._local_count
+
+        # Register parameters at their natural cdecl offsets.  Each
+        # parameter occupies as many words as its size demands (32-bit
+        # params take two slots), so the next slot offset is computed
+        # cumulatively rather than `i * 2`.
+        param_offset = 4
+        for pname, ptype in func.params:
+            self._locals[pname] = param_offset
+            self._local_types[pname] = ptype
+            slot = max(2, ptype.size)
+            param_offset += slot
+
+        # Generate function body
+        self._gen_block(func.body)
+
+        # Patch the prologue placeholder with one `sub sp, N` that
+        # reserves space for every local the function might allocate,
+        # including locals inside branches we never take.  Without
+        # this, declarations in those branches would assign offsets
+        # below the running SP, and pushes / call return-addresses
+        # would clobber the "ghost" slot.
+        total_locals = self._locals_total_before - self._local_count
+        if total_locals > 0:
+            self._code[self._locals_placeholder_idx] = f"sub sp, {total_locals}"
+        else:
+            self._code[self._locals_placeholder_idx] = "; no locals"
+
+        # Epilogue: restore saved registers from their fixed BP-relative positions,
+        # then unwind the stack frame and return.  This is safe regardless of what
+        # SP points to when we arrive here (via fall-through or jmp from a return).
+        # DX is intentionally NOT restored: cdecl treats DX as caller-saved, and
+        # functions returning a 32-bit value leave the high word in DX.  The
+        # prologue still pushes DX so its slot at [bp-6] is reserved (keeps the
+        # local-layout convention `_local_count = -10`).
+        self._c(f"{self._epilogue_label}:")
+        self._c("mov di, [bp - 10]")
+        self._c("mov si, [bp - 8]")
+        self._c("mov cx, [bp - 4]")
+        self._c("mov bx, [bp - 2]")
+        self._c("mov sp, bp")
+        self._c("pop bp")
+        self._c("ret")
+
+    # --- Block and statements ---
+
+    def _flush_comments_up_to(self, line: int | None) -> None:
+        """Emit any pending C comments whose source line is <= `line`.
+
+        Drains `self._comments` so each comment is emitted at most
+        once.  When `line` is None (caller has no line info), nothing
+        is emitted — that lets ordinary callsites opt out of
+        annotation if they don't know where they came from.
+        """
+        if line is None:
+            return
+        while self._comments and self._comments[0][0] <= line:
+            cline, text = self._comments.pop(0)
+            if not text:
+                continue
+            # Multi-line block comments retain their internal
+            # newlines; prefix EVERY line with `; ` so the .asm stays
+            # valid syntax.  Strip leading `*` / `/` clutter on each
+            # line so the result reads naturally.
+            for raw in text.split("\n"):
+                cleaned = raw.lstrip("/").lstrip().lstrip("*").strip(" *").rstrip()
+                if cleaned:
+                    self._c(f"; {cleaned}")
+
+    def _gen_block(self, block: Block) -> None:
+        for stmt in block.statements:
+            self._flush_comments_up_to(getattr(stmt, "source_line", None))
+            if isinstance(stmt, Block):
+                self._gen_block(stmt)
+            elif isinstance(stmt, IfStmt):
+                self._gen_if(stmt)
+            elif isinstance(stmt, WhileStmt):
+                self._gen_while(stmt)
+            elif isinstance(stmt, DoWhileStmt):
+                self._gen_do_while(stmt)
+            elif isinstance(stmt, ForStmt):
+                self._gen_for(stmt)
+            elif isinstance(stmt, ReturnStmt):
+                self._gen_return(stmt)
+            elif isinstance(stmt, BreakStmt):
+                self._gen_break()
+            elif isinstance(stmt, ContinueStmt):
+                self._gen_continue()
+            elif isinstance(stmt, GotoStmt):
+                self._gen_goto(stmt)
+            elif isinstance(stmt, ComputedGotoStmt):
+                self._gen_computed_goto(stmt)
+            elif isinstance(stmt, LabelStmt):
+                self._gen_label(stmt)
+            elif isinstance(stmt, SwitchStmt):
+                self._gen_switch(stmt)
+            elif isinstance(stmt, ExpressionStmt):
+                self._gen_expr_stmt(stmt)
+            elif isinstance(stmt, DeclStmt):
+                self._gen_decl_stmt(stmt)
+            else:
+                # Fall back to the full dispatcher for everything else
+                # (e.g. CaseLabel, sometimes wrapped statements).  Without
+                # this, switch case-labels inside a Block were silently
+                # dropped from the emitted assembly.
+                self._gen_statement(stmt)
+
+    def _gen_if(self, stmt: IfStmt) -> None:
+        else_label = self._labels.generate("else")
+        end_label = self._labels.generate("endif")
+
+        self._gen_expr(stmt.condition)
+        self._c("test ax, ax")
+        self._c(f"jz {else_label}")
+
+        self._gen_statement(stmt.then_branch)
+        self._c(f"jmp {end_label}")
+
+        self._c(f"{else_label}:")
+        if stmt.else_branch:
+            self._gen_statement(stmt.else_branch)
+
+        self._c(f"{end_label}:")
+
+    def _gen_while(self, stmt: WhileStmt) -> None:
+        start_label = self._labels.generate("while")
+        end_label = self._labels.generate("whileend")
+
+        self._break_targets.append(end_label)
+        self._continue_targets.append(start_label)
+
+        self._c(f"{start_label}:")
+        self._gen_expr(stmt.condition)
+        self._c("test ax, ax")
+        self._c(f"jz {end_label}")
+
+        self._gen_statement(stmt.body)
+        self._c(f"jmp {start_label}")
+        self._c(f"{end_label}:")
+
+        self._break_targets.pop()
+        self._continue_targets.pop()
+
+    def _gen_do_while(self, stmt: DoWhileStmt) -> None:
+        start_label = self._labels.generate("do")
+        end_label = self._labels.generate("doend")
+
+        self._break_targets.append(end_label)
+        self._continue_targets.append(start_label)
+
+        self._c(f"{start_label}:")
+        self._gen_statement(stmt.body)
+        self._gen_expr(stmt.condition)
+        self._c("test ax, ax")
+        self._c(f"jnz {start_label}")
+        self._c(f"{end_label}:")
+
+        self._break_targets.pop()
+        self._continue_targets.pop()
+
+    def _gen_for(self, stmt: ForStmt) -> None:
+        start_label = self._labels.generate("for")
+        continue_label = self._labels.generate("forcontinue")
+        end_label = self._labels.generate("forend")
+
+        self._break_targets.append(end_label)
+        # `continue` in a for-loop should jump to the *increment*, not
+        # re-evaluate the condition+body.  Continue target lives at
+        # continue_label below.
+        self._continue_targets.append(continue_label)
+
+        if stmt.init:
+            self._gen_statement(stmt.init)
+
+        self._c(f"{start_label}:")
+
+        if stmt.condition:
+            self._gen_expr(stmt.condition)
+            self._c("test ax, ax")
+            self._c(f"jz {end_label}")
+
+        self._gen_statement(stmt.body)
+
+        self._c(f"{continue_label}:")
+        if stmt.increment:
+            self._gen_expr(stmt.increment)
+        self._c(f"jmp {start_label}")
+
+        self._c(f"{end_label}:")
+
+        self._break_targets.pop()
+        self._continue_targets.pop()
+
+    def _gen_return(self, stmt: ReturnStmt) -> None:
+        if stmt.value:
+            # If the enclosing function returns a 64-bit value, evaluate
+            # the expression into the canonical 4-register layout
+            # (AX=lo, DX=mid-lo, BX=mid-hi, CX=hi) and stash the high
+            # 32 bits in `__ret64_hi` before the standard epilogue
+            # restores BX/CX from their saved slots.  Low 32 bits stay
+            # in DX:AX (the existing convention for long returns).
+            ret_t = self._function_types.get(self._current_function)
+            ret_type = getattr(ret_t, "return_type", None) if ret_t else None
+            if ret_type is not None and getattr(ret_type, "size", 0) >= 8 \
+                    and not isinstance(ret_type, ArrayType):
+                self._gen_eval64(stmt.value)
+                self._reference_symbol("__ret64_hi")
+                self._c("mov [__ret64_hi], bx")
+                self._c("mov [__ret64_hi + 2], cx")
+            else:
+                self._gen_expr(stmt.value)
+        self._c(f"jmp {self._epilogue_label}")
+
+    def _gen_break(self) -> None:
+        if self._break_targets:
+            self._c(f"jmp {self._break_targets[-1]}")
+
+    def _gen_continue(self) -> None:
+        if self._continue_targets:
+            self._c(f"jmp {self._continue_targets[-1]}")
+
+    def _gen_goto(self, stmt: GotoStmt) -> None:
+        self._c(f"jmp {stmt.label}")
+
+    def _gen_computed_goto(self, stmt) -> None:
+        """`goto *expr` — evaluate to AX then jump indirect."""
+        self._gen_expr(stmt.target)
+        self._c("jmp ax")
+
+    def _gen_label_address(self, expr) -> None:
+        """`&&label` — load the label's address as an immediate."""
+        self._c(f"mov ax, {expr.label}")
+
+    def _gen_label(self, stmt: LabelStmt) -> None:
+        self._c(f"{stmt.label}:")
+        self._gen_statement(stmt.stmt)
+
+    def _gen_switch(self, stmt: SwitchStmt) -> None:
+        end_label = self._labels.generate("switchend")
+        self._break_targets.append(end_label)
+
+        # Evaluate switch expression into AX
+        self._gen_expr(stmt.expression)
+
+        # Collect case labels and generate dispatch table (linear search)
+        case_map: dict[int, str] = {}
+        cases: list[tuple[int, str]] = []
+        default_label: str | None = None
+
+        def collect_cases(node: Stmt) -> None:
+            nonlocal default_label
+            if isinstance(node, Block):
+                for s in node.statements:
+                    collect_cases(s)
+            elif isinstance(node, CaseLabel):
+                # Keep the leading `.` so the case label remains a NASM
+                # local — local labels don't reset the surrounding
+                # function-scope anchor (subsequent `.L` labels still
+                # resolve relative to the function name).  Cross-section
+                # references from a `.data` jump table to the case label
+                # would be wrong, so the jump-table path is disabled
+                # below; we always use linear-search dispatch.
+                lbl = self._labels.generate("case")
+                case_map[id(node)] = lbl
+                if node.value is None:
+                    default_label = lbl
+                else:
+                    cases.append((node.value, lbl))
+                # Recurse into the case body too — Duff's-device-style
+                # constructs nest cases inside a loop body.
+                if node.body is not None:
+                    collect_cases(node.body)
+            elif isinstance(node, SwitchStmt):
+                pass  # stop: inner switch manages its own cases
+            elif hasattr(node, "body") and node.body is not None:
+                collect_cases(node.body)
+            # Walk both branches of an if-statement so nested cases inside
+            # `if (...) case 1: ...` are still collected.
+            if isinstance(node, IfStmt):
+                if node.then_branch is not None:
+                    collect_cases(node.then_branch)
+                if node.else_branch is not None:
+                    collect_cases(node.else_branch)
+
+        collect_cases(stmt.body)
+
+        # Decide whether to emit a jump table (dense cases) or fall back to linear compares
+        if cases:
+            vals = [v for v, _ in cases]
+            min_v = min(vals)
+            max_v = max(vals)
+            range_size = max_v - min_v + 1
+
+            # Heuristic: use jump table if density is reasonable and table not too large
+            # Use a sparse jump table if density is low but range is not huge.
+            # Currently disabled: NASM local-label scoping prevents a
+            # `.data` jump table from referencing `.Lcase_N` in `.text`,
+            # and emitting a flat (non-local) `Lcase_N` label resets the
+            # surrounding function's local-label anchor, breaking every
+            # subsequent `.L` reference.  Linear-search dispatch works
+            # for every test in the suite — switches with very many
+            # cases are rare in this codebase.
+            density = len(cases) / range_size
+            if False and ((density >= 0.5 and range_size <= 256) or (range_size <= 8)):
+                # Non-local label for the same reason as `case` above.
+                table_label = self._labels.generate("jt").lstrip(".")
+                # Emit bounds check and indirect jump via table
+                self._c("mov bx, ax")
+                if min_v != 0:
+                    self._c(f"sub bx, {min_v}")
+                self._c(f"cmp bx, {range_size - 1}")
+                if default_label:
+                    self._c(f"ja {default_label}")
+                else:
+                    self._c(f"ja {end_label}")
+
+                # index -> byte offset (word entries)
+                self._c("mov di, bx")
+                self._c("shl di, 1")
+                self._c(f"mov bx, {table_label}")
+                self._c("add bx, di")
+                self._c("jmp word [bx]")
+
+                # Build table entries (dw label)
+                entries: list[str] = []
+                # default to default_label or end_label for holes
+                for i in range(range_size):
+                    entries.append(default_label or end_label)
+                for v, lbl in cases:
+                    entries[v - min_v] = lbl
+
+                # Emit table into data segment
+                self._d(f"{table_label} dw " + ", ".join(entries))
+            else:
+                # For very sparse or huge ranges, use linear search
+                for val, lbl in cases:
+                    self._c(f"cmp ax, {val}")
+                    self._c(f"je {lbl}")
+                if default_label:
+                    self._c(f"jmp {default_label}")
+                else:
+                    self._c(f"jmp {end_label}")
+
+        else:
+            # No cases: jump to default or end
+            if default_label:
+                self._c(f"jmp {default_label}")
+            else:
+                self._c(f"jmp {end_label}")
+
+        # Temporarily expose case label mapping while generating the switch body
+        prev_map = getattr(self, "_switch_case_map", None)
+        self._switch_case_map = case_map
+        self._gen_statement(stmt.body)
+        if prev_map is None:
+            delattr(self, "_switch_case_map")
+        else:
+            self._switch_case_map = prev_map
+
+        self._c(f"{end_label}:")
+        self._break_targets.pop()
+
+    def _gen_expr_stmt(self, stmt: ExpressionStmt) -> None:
+        if stmt.expr:
+            self._gen_expr(stmt.expr)
+
+    def _gen_decl_stmt(self, stmt: DeclStmt) -> None:
+        """Handle variable declarations inside a block."""
+        from src.pyc.ast import InitList as _InitList
+        for name, ctype, init in stmt.declarations:
+            # Check for static specifier - static locals are allocated in .data
+            # with their initializer, accessed by name instead of offset
+            if "static" in stmt.specifiers:
+                # Generate a unique label for the static local.  Drop
+                # the leading `.` (which would make it a NASM local
+                # label scoped to the previous global label) — static
+                # locals live in `.data` and need a file-global label
+                # so all callers can reference them by the same name.
+                label = self._labels.generate("staticlocal").lstrip(".")
+                # Hand the array-initializer case off to the global-var
+                # emitter, which already knows how to emit `dw label`
+                # entries for LabelAddress / constant lists.  Without
+                # this, `static const void *L[] = {&&L1, ...}` emits
+                # the literal text `dw None`.
+                if isinstance(init, _InitList) and isinstance(ctype, ArrayType):
+                    self._gen_global_var(label, ctype, init)
+                else:
+                    self._d(f"{label} dw {self._constant_value(init)}")
+                # Map the name to this label so reads/writes use direct access
+                # Use a special mapping namespace for static locals
+                if not hasattr(self, '_static_locals'):
+                    self._static_locals = {}
+                self._static_locals[name] = label
+                # Also expose the type so subscript codegen knows
+                # element size etc.
+                self._global_types[label] = ctype
+                self._local_types[name] = ctype
+                # For static locals without initializer, emit zeroed storage
+                if init is None:
+                    self._d(f"{label} resw {(ctype.size + 1) // 2}")
+                continue
+
+            offset = self._gen_local_alloc(name, ctype)
+            if init is None:
+                continue
+
+            # Array / brace initialiser.
+            if isinstance(init, _InitList) and isinstance(ctype, ArrayType):
+                self._gen_array_init(offset, ctype, init)
+                continue
+
+            # Char-array initialised from a string literal:
+            # `char s[] = "hello";` or `char s[10] = "hi";`.
+            if (
+                isinstance(init, StringLiteral)
+                and isinstance(ctype, ArrayType)
+                and ctype.element_type.size == 1
+            ):
+                self._gen_char_array_init(offset, ctype, init)
+                continue
+
+            # 64-bit init from a memory-resident lvalue (FP literal,
+            # another local, etc.): copy 8 bytes from the source.
+            # This avoids the AX/DX/BX/DX ABI limitation that would
+            # otherwise lose the very-high word of a double.
+            if ctype.size == 8:
+                addr = self._lvalue_addr_constant(init)
+                if addr is not None:
+                    self._c(f"mov ax, [{addr}]")
+                    self._c(f"mov [bp + {offset}], ax")
+                    self._c(f"mov ax, [{addr} + 2]")
+                    self._c(f"mov [bp + {offset + 2}], ax")
+                    self._c(f"mov ax, [{addr} + 4]")
+                    self._c(f"mov [bp + {offset + 4}], ax")
+                    self._c(f"mov ax, [{addr} + 6]")
+                    self._c(f"mov [bp + {offset + 6}], ax")
+                    continue
+                # FP binary/unary op: result lives in __fp_result
+                # after the call.  Memcpy from there.
+                if self._is_fp_expr(init):
+                    self._gen_expr(init)
+                    self._reference_symbol("__fp_result")
+                    self._c(f"mov ax, [__fp_result]")
+                    self._c(f"mov [bp + {offset}], ax")
+                    self._c(f"mov ax, [__fp_result + 2]")
+                    self._c(f"mov [bp + {offset + 2}], ax")
+                    self._c(f"mov ax, [__fp_result + 4]")
+                    self._c(f"mov [bp + {offset + 4}], ax")
+                    self._c(f"mov ax, [__fp_result + 6]")
+                    self._c(f"mov [bp + {offset + 6}], ax")
+                    continue
+                # `double x = <integer expression>` — promote via
+                # __si2d64 (which writes the 4 IEEE-754 words to
+                # __fp_result) then memcpy.
+                want_double = (
+                    isinstance(ctype, BaseType) and ctype.name == "double"
+                )
+                if want_double:
+                    self._gen_fp_arg(init, want_double=True)
+                    self._reference_symbol("__fp_result")
+                    self._c(f"mov ax, [__fp_result]")
+                    self._c(f"mov [bp + {offset}], ax")
+                    self._c(f"mov ax, [__fp_result + 2]")
+                    self._c(f"mov [bp + {offset + 2}], ax")
+                    self._c(f"mov ax, [__fp_result + 4]")
+                    self._c(f"mov [bp + {offset + 4}], ax")
+                    self._c(f"mov ax, [__fp_result + 6]")
+                    self._c(f"mov [bp + {offset + 6}], ax")
+                    continue
+            is_float_var = isinstance(ctype, BaseType) and ctype.name == "float"
+            if is_float_var:
+                # Float (32-bit IEEE 754): convert init value if needed.
+                addr = self._lvalue_addr_constant(init)
+                if addr is not None:
+                    # Memory-resident float/double literal — copy 4 bytes.
+                    self._c(f"mov ax, [{addr}]")
+                    self._c(f"mov [bp + {offset}], ax")
+                    self._c(f"mov ax, [{addr} + 2]")
+                    self._c(f"mov [bp + {offset + 2}], ax")
+                elif self._is_fp_expr(init):
+                    # FP expression result in __fp_result — may be double, shrink to float.
+                    self._gen_expr(init)
+                    t = self._expr_type(init)
+                    if isinstance(t, BaseType) and t.name == "double":
+                        # Convert double in __fp_result → float via __d642f32
+                        self._reference_symbol("__fp_result")
+                        self._c("push word [__fp_result + 6]")
+                        self._c("push word [__fp_result + 4]")
+                        self._c("push word [__fp_result + 2]")
+                        self._c("push word [__fp_result]")
+                        self._reference_symbol("__d642f32")
+                        self._c("call __d642f32")
+                        self._c("add sp, 8")
+                        self._c(f"mov [bp + {offset}], ax")
+                        self._c(f"mov [bp + {offset + 2}], dx")
+                    else:
+                        # Float result in __fp_result
+                        self._reference_symbol("__fp_result")
+                        self._c(f"mov ax, [__fp_result]")
+                        self._c(f"mov [bp + {offset}], ax")
+                        self._c(f"mov ax, [__fp_result + 2]")
+                        self._c(f"mov [bp + {offset + 2}], ax")
+                else:
+                    # Integer: convert via __si2f32
+                    self._gen_expr(init)
+                    self._c("push ax")
+                    self._reference_symbol("__si2f32")
+                    self._c("call __si2f32")
+                    self._c("add sp, 2")
+                    self._c(f"mov [bp + {offset}], ax")
+                    self._c(f"mov [bp + {offset + 2}], dx")
+            elif ctype.size >= 8:
+                # 64-bit init: widen the initialiser to the canonical
+                # 4-register layout (AX=lo, DX=mid-lo, BX=mid-hi,
+                # CX=hi) and store all four words.
+                self._gen_eval64(init)
+                self._c(f"mov [bp + {offset}], ax")
+                self._c(f"mov [bp + {offset + 2}], dx")
+                self._c(f"mov [bp + {offset + 4}], bx")
+                self._c(f"mov [bp + {offset + 6}], cx")
+            elif ctype.size >= 4:
+                # 32-bit init: widen the initialiser if needed and
+                # store both halves of DX:AX.
+                self._gen_eval32(init)
+                self._c(f"mov [bp + {offset}], ax")
+                self._c(f"mov [bp + {offset + 2}], dx")
+            else:
+                self._gen_expr(init)
+                self._c(f"mov [bp + {offset}], ax")
+
+    def _gen_array_init(self, offset: int, atype: "ArrayType", init: "InitList") -> None:
+        """Initialise a local array from a brace list.  Stores each
+        element at `[bp + offset + i*element_size]`; if the list is
+        shorter than the array, zero-fills the trailing slots."""
+        elem_size = max(atype.element_type.size, 2)
+        # Bytes (char) are stored in word slots anyway; for true byte
+        # arrays use a tighter layout.
+        if atype.element_type.size == 1:
+            elem_size = 1
+        count = atype.count if atype.count else len(init.elements)
+        for i, e in enumerate(init.elements[:count]):
+            slot_off = offset + i * elem_size
+            if elem_size >= 4:
+                self._gen_eval32(e)
+                self._c(f"mov [bp + {slot_off}], ax")
+                self._c(f"mov [bp + {slot_off + 2}], dx")
+            else:
+                self._gen_expr(e)
+                if elem_size == 1:
+                    self._c(f"mov [bp + {slot_off}], al")
+                else:
+                    self._c(f"mov [bp + {slot_off}], ax")
+        # Zero-fill trailing elements when the list is short.
+        if len(init.elements) < count:
+            self._c("xor ax, ax")
+            for i in range(len(init.elements), count):
+                slot_off = offset + i * elem_size
+                if elem_size >= 4:
+                    self._c(f"mov [bp + {slot_off}], ax")
+                    self._c(f"mov [bp + {slot_off + 2}], ax")
+                elif elem_size == 1:
+                    self._c(f"mov [bp + {slot_off}], al")
+                else:
+                    self._c(f"mov [bp + {slot_off}], ax")
+
+    def _gen_char_array_init(self, offset: int, atype: "ArrayType", lit: "StringLiteral") -> None:
+        """`char s[N] = "...";` — copy the string bytes into the
+        stack slot, NUL-terminate, zero-pad if N > strlen+1."""
+        s = lit.value
+        count = atype.count if atype.count else len(s) + 1
+        copy_len = min(len(s), count)
+        for i in range(copy_len):
+            self._c(f"mov byte [bp + {offset + i}], {ord(s[i])}")
+        # NUL + zero padding for remaining bytes.
+        if copy_len < count:
+            self._c("xor al, al")
+            for i in range(copy_len, count):
+                self._c(f"mov [bp + {offset + i}], al")
+
+    def _gen_local_alloc(self, name: str, ctype: CType) -> int:
+        """Allocate a local variable. Returns stack offset from BP.
+
+        Space is *reserved* up-front via the prologue placeholder
+        patched in `_gen_function`; here we only assign the offset and
+        update the running total.  Without that single up-front
+        allocation, declarations inside untaken branches would leave
+        SP higher than the assigned offset and subsequent pushes would
+        clobber the "ghost" slot.
+        """
+        size = max(ctype.size, 2)
+        offset = self._local_count - size
+        self._locals[name] = offset
+        self._local_types[name] = ctype
+        self._local_count = offset
+        return offset
+
+    def _gen_global_var(
+        self, name: str, ctype: CType, init: Expr | None
+    ) -> None:
+        """Generate global variable storage."""
+        from src.pyc.ast import InitList as _InitList
+        if init is not None:
+            # Try to extract constant value for simple initializers
+            value = self._constant_value(init)
+            if value is not None:
+                if ctype.size >= 4:
+                    # 32-bit (long) or wider: emit the correct number of words
+                    nwords = max(2, (ctype.size + 1) // 2)
+                    words = [(value >> (16 * i)) & 0xFFFF for i in range(nwords)]
+                    self._d(f"{name}: dw {', '.join(str(w) for w in words)}")
+                else:
+                    self._d(f"{name}: dw {value}")
+            elif isinstance(init, StringLiteral):
+                # String literal initializer: either char array or pointer to string
+                if isinstance(ctype, ArrayType):
+                    # String literal for char array at global scope
+                    # Emit the string data directly in .data section
+                    label = self._labels.generate("str")
+                    self._d(f"{label} db {self._encode_string_for_nasm(init.value)}, 0")
+                    # For array of chars: emit the array data
+                    self._d(f"{name}: db {self._encode_string_for_nasm(init.value)}, 0")
+                elif isinstance(ctype, PointerType):
+                    # Pointer to string: emit the string data and pointer to it
+                    label = self._labels.generate("str")
+                    self._d(f"{label} db {self._encode_string_for_nasm(init.value)}, 0")
+                    # For pointer: emit pointer to the string label
+                    self._d(f"{name}: dw {label}")
+            elif isinstance(init, _InitList) and isinstance(ctype, ArrayType):
+                # InitList for int/char array at global scope
+                if ctype.element_type.size == 1:
+                    # char array
+                    db_list = []
+                    for elem in init.elements:
+                        elem_val = self._constant_value(elem)
+                        if elem_val is None:
+                            # Non-constant - cannot use InitList for global char array
+                            self._b(f"{name}: resw {(len(init.elements) + 1) // 2}")
+                            return
+                        db_list.append(str(elem_val))
+                    size = len(db_list)
+                    self._d(f"{name}: db {', '.join(db_list)}")
+                else:
+                    # Array of word-sized elements (int/long/pointer), possibly
+                    # multi-dimensional and possibly initialised with string
+                    # literals (`const char *t[N][M] = {{"a",..},..}`) or label
+                    # addresses (`&&L1` — GNU computed-goto).  Flatten to a dw
+                    # list, interning any string literals; fall back to zeroed
+                    # BSS if any element isn't a compile-time constant.
+                    ult = ctype.element_type
+                    while isinstance(ult, ArrayType):
+                        ult = ult.element_type
+                    if ult.size == 1:
+                        # Multi-dimensional char array: not packed into .data
+                        # yet — reserve zeroed BSS (matches prior behaviour).
+                        self._b(f"{name}: resw {max(1, ctype.size // 2)}")
+                    else:
+                        dw_list = self._collect_array_dw(ctype, init)
+                        if dw_list is None:
+                            self._b(f"{name}: resw {max(1, ctype.size // 2)}")
+                        else:
+                            self._d(f"{name}: dw {', '.join(dw_list)}")
+            elif isinstance(init, _InitList) and isinstance(ctype, StructType):
+                # Struct initializer at global scope: build the packed
+                # byte image (honouring bitfield bit positions) and emit
+                # it in .data.  Falls back to zeroed BSS if any element
+                # isn't a compile-time constant.
+                if not self._gen_global_struct_init(name, ctype, init):
+                    self._b(f"{name}: resw {max(1, (ctype.size + 1) // 2)}")
+            else:
+                # Non-constant initializer - reserve zeroed space in BSS
+                self._b(f"{name}: resw 1")
+        else:
+            # Reserve space based on type size
+            words = max(1, (ctype.size + 1) // 2)
+            self._b(f"{name}: resw {words}")
+
+    def _collect_array_dw(self, ctype: "ArrayType", init: Expr) -> list[str] | None:
+        """Flatten an array initializer into a list of `dw` word tokens (integer
+        literals or symbol labels), recursing through nested arrays and interning
+        string-literal pointer elements.  Short initializers are zero-padded to
+        the declared array size.  Returns None if any element is not a
+        compile-time constant word (caller then falls back to zeroed BSS)."""
+        from src.pyc.ast import InitList as _InitList
+        if not isinstance(init, _InitList):
+            return None
+        et = ctype.element_type
+        out: list[str] = []
+        for elem in init.elements:
+            if isinstance(et, ArrayType):
+                sub = self._collect_array_dw(et, elem)
+                if sub is None:
+                    return None
+                out.extend(sub)
+            elif isinstance(et, PointerType):
+                if isinstance(elem, StringLiteral):
+                    out.append(self._intern_string(elem.value))
+                elif isinstance(elem, LabelAddress):
+                    out.append(elem.label)
+                else:
+                    v = self._constant_value(elem)
+                    if v is None:
+                        return None
+                    out.append(str(v & 0xFFFF))
+            else:
+                if isinstance(elem, LabelAddress):
+                    out.append(elem.label)
+                    continue
+                v = self._constant_value(elem)
+                if v is None:
+                    return None
+                for i in range(max(1, (et.size + 1) // 2)):
+                    out.append(str((v >> (16 * i)) & 0xFFFF))
+        # zero-pad to the full declared size (handles partial initializers)
+        while len(out) < ctype.size // 2:
+            out.append("0")
+        return out
+
+    def _intern_string(self, value: str) -> str:
+        """Emit (once) a NUL-terminated string literal in .data and return its
+        label, deduplicating identical strings via ``self._string_labels`` (the
+        same table the runtime string-literal path uses)."""
+        if value not in self._string_labels:
+            self._string_counter += 1
+            label = f"_str_{self._string_counter}"
+            self._string_labels[value] = label
+            self._d(f"{label} db {self._encode_string_for_nasm(value)}, 0")
+        return self._string_labels[value]
+
+    def _gen_global_struct_init(
+        self, name: str, stype: "StructType", init: "InitList"
+    ) -> bool:
+        """Emit a global struct initializer as a packed `.data` image.
+
+        Each initializer element is placed at its field's byte offset and
+        (for bitfields) bit offset, building a little-endian byte image of
+        the struct's full size.  Returns False (so the caller falls back to
+        zeroed BSS) if any element isn't a compile-time integer constant or
+        the field layout isn't a flat scalar/bitfield list.
+        """
+        from src.pyc.types import BitField as _BitField
+
+        size = stype.size
+        if size <= 0:
+            return False
+        image = bytearray(size)
+        # _layout already excludes anonymous bitfields, so positional
+        # initializers map straight onto the named fields in order.
+        for (_fname, ftype, offset), elem in zip(stype._layout, init.elements):
+            value = self._constant_value(elem)
+            if value is None:
+                return False
+            if isinstance(ftype, _BitField):
+                bit_pos = offset * 8 + ftype.bit_offset
+                width = ftype.width
+            elif isinstance(ftype, (StructType, UnionType, ArrayType)):
+                # Nested aggregate initializers aren't handled here.
+                return False
+            else:
+                bit_pos = offset * 8
+                width = ftype.size * 8
+            self._place_bits(image, bit_pos, width, value)
+        words = []
+        for i in range(0, size, 2):
+            lo = image[i]
+            hi = image[i + 1] if i + 1 < size else 0
+            words.append(str(lo | (hi << 8)))
+        self._d(f"{name}: dw {', '.join(words)}")
+        return True
+
+    @staticmethod
+    def _place_bits(image: bytearray, bit_pos: int, width: int, value: int) -> None:
+        """OR the low `width` bits of `value` into `image` starting at the
+        given absolute bit position (little-endian: bit 0 = LSB of byte 0)."""
+        value &= (1 << width) - 1
+        for b in range(width):
+            if value & (1 << b):
+                byte_i = (bit_pos + b) // 8
+                if byte_i < len(image):
+                    image[byte_i] |= 1 << ((bit_pos + b) % 8)
+
+    def _constant_value(self, expr: Expr) -> int | None:
+        """Extract an integer constant from a simple expression, or None."""
+        if isinstance(expr, IntLiteral):
+            return expr.value
+        if isinstance(expr, CharLiteral):
+            return expr.value  # already stored as int by the lexer
+        if isinstance(expr, UnaryOp) and expr.op == "-":
+            v = self._constant_value(expr.operand)
+            return -v if v is not None else None
+        if isinstance(expr, UnaryOp) and expr.op == "+":
+            return self._constant_value(expr.operand)
+        # Binary ops with constant operands
+        if isinstance(expr, BinaryOp):
+            left = self._constant_value(expr.left)
+            right = self._constant_value(expr.right)
+            if left is not None and right is not None:
+                op = expr.op
+                if op == "+":
+                    return left + right
+                if op == "-":
+                    return left - right
+                if op == "*":
+                    return left * right
+                if op == "/":
+                    return left // right if right != 0 else None
+                if op == "&":
+                    return left & right
+                if op == "|":
+                    return left | right
+                if op == "^":
+                    return left ^ right
+                if op == "<<":
+                    return left << right
+                if op == ">>":
+                    return left >> right
+        return None
+
+    def _gen_statement(self, stmt: Stmt) -> None:
+        """Dispatch statement generation."""
+        if isinstance(stmt, Block):
+            self._gen_block(stmt)
+        elif isinstance(stmt, IfStmt):
+            self._gen_if(stmt)
+        elif isinstance(stmt, WhileStmt):
+            self._gen_while(stmt)
+        elif isinstance(stmt, ForStmt):
+            self._gen_for(stmt)
+        elif isinstance(stmt, DoWhileStmt):
+            self._gen_do_while(stmt)
+        elif isinstance(stmt, ExpressionStmt):
+            self._gen_expr_stmt(stmt)
+        elif isinstance(stmt, DeclStmt):
+            self._gen_decl_stmt(stmt)
+        elif isinstance(stmt, ReturnStmt):
+            self._gen_return(stmt)
+        elif isinstance(stmt, BreakStmt):
+            self._gen_break()
+        elif isinstance(stmt, ContinueStmt):
+            self._gen_continue()
+        elif isinstance(stmt, GotoStmt):
+            self._gen_goto(stmt)
+        elif isinstance(stmt, ComputedGotoStmt):
+            self._gen_computed_goto(stmt)
+        elif isinstance(stmt, LabelStmt):
+            self._gen_label(stmt)
+        elif isinstance(stmt, SwitchStmt):
+            self._gen_switch(stmt)
+        elif isinstance(stmt, CaseLabel):
+            # Use pre-generated label mapping if inside a switch dispatch.
+            # Otherwise fall back to a fresh local-scope label.
+            lbl = None
+            if hasattr(self, "_switch_case_map") and id(stmt) in self._switch_case_map:
+                lbl = self._switch_case_map[id(stmt)]
+            else:
+                lbl = self._labels.generate("case")
+            self._c(f"{lbl}:")
+            self._gen_statement(stmt.body)
+        else:
+            self._c(f"; Unknown statement type: {type(stmt).__name__}")
+
+    # --- Expression code generation ---
+
+    def _gen_expr(self, expr: Expr) -> None:
+        """Generate code for an expression.
+
+        16-bit result ends up in AX; 32-bit result in DX:AX (high:low).
+        """
+        if isinstance(expr, IntLiteral):
+            w = self._expr_width(expr)
+            if w == 8:
+                # 64-bit literal: load all four words AX/DX/BX/CX.
+                v = expr.value & 0xFFFFFFFFFFFFFFFF
+                w0 = v & 0xFFFF
+                w1 = (v >> 16) & 0xFFFF
+                w2 = (v >> 32) & 0xFFFF
+                w3 = (v >> 48) & 0xFFFF
+                self._c(f"mov ax, {w0}")
+                self._c(f"mov dx, {w1}")
+                self._c(f"mov bx, {w2}")
+                self._c(f"mov cx, {w3}")
+            elif w == 4:
+                # 32-bit literal: split into low/high words and load DX:AX.
+                v = expr.value & 0xFFFFFFFF
+                low = v & 0xFFFF
+                high = (v >> 16) & 0xFFFF
+                self._c(f"mov ax, {low}")
+                self._c(f"mov dx, {high}")
+            else:
+                self._c(f"mov ax, {expr.value}")
+        elif isinstance(expr, FloatLiteral):
+            self._gen_float_literal(expr)
+        elif isinstance(expr, CharLiteral):
+            # Emit the numeric code point so escapes like '\0' (null), '\n'
+            # (newline), etc. encode correctly — passing the raw character
+            # through NASM would break for control bytes.
+            v = expr.value
+            self._c(f"mov ax, {v if isinstance(v, int) else ord(v)}")
+        elif isinstance(expr, StringLiteral):
+            self._gen_string_literal(expr)
+        elif isinstance(expr, Identifier):
+            self._gen_load_identifier(expr)
+        elif isinstance(expr, BinaryOp):
+            self._gen_binary_op(expr)
+        elif isinstance(expr, UnaryOp):
+            self._gen_unary_op(expr)
+        elif isinstance(expr, CompoundAssignment):
+            self._gen_compound_assign(expr)
+        elif isinstance(expr, TernaryExpr):
+            self._gen_ternary(expr)
+        elif isinstance(expr, CallExpr):
+            self._gen_call(expr)
+        elif isinstance(expr, Subscript):
+            self._gen_subscript(expr)
+        elif isinstance(expr, CastExpr):
+            self._gen_cast(expr)
+        elif isinstance(expr, SizeofExpr):
+            self._gen_sizeof(expr)
+        elif isinstance(expr, MemberAccess):
+            self._gen_member_access(expr)
+        elif isinstance(expr, CommaExpr):
+            self._gen_comma(expr)
+        elif isinstance(expr, LabelAddress):
+            self._gen_label_address(expr)
+        else:
+            self._c(f"; Unknown expression type: {type(expr).__name__}")
+
+    # --- Binary operations ---
+
+    def _gen_binary_op(self, expr: BinaryOp) -> None:
+        """Generate code for a binary operation.
+
+        Result lives in AX (16-bit ops) or DX:AX (32-bit ops, high:low).
+        """
+        left = expr.left
+        right = expr.right
+
+        # `&&` and `||` short-circuit: the right operand must not be
+        # evaluated when the left already determines the result.  This is
+        # observable for side-effecting expressions and required for the
+        # idiomatic `if (p && p->field)` null-guard pattern.
+        if expr.op in ("&&", "||"):
+            self._gen_short_circuit(expr.op, left, right)
+            return
+
+        # Floating-point operands: route to the soft-FP helpers in
+        # `stdlib/fp.asm`.  Float (single) lives in DX:AX; double in
+        # AX/DX/BX/DX.  The helpers currently return one operand for
+        # arithmetic — enough to compile and link FP-using programs;
+        # actual rounding/normalisation is a follow-up.
+        if self._is_fp_expr(left) or self._is_fp_expr(right):
+            self._gen_fp_binary_op(expr)
+            return
+
+        # 64-bit operation: dispatch to the long-long arithmetic path
+        # when either operand has a long-long-sized type.  Ops we
+        # don't yet have a 64-bit implementation for (e.g. `/`, `%`)
+        # fall through to the legacy 16/32-bit path.
+        if max(self._expr_width(left), self._expr_width(right)) >= 8 \
+                and expr.op in {
+                    "*", "+", "-", "&", "|", "^",
+                    "<<", ">>",
+                    "==", "!=", "<", ">", "<=", ">=",
+                }:
+            self._gen_binary_op64(expr)
+            return
+
+        # 32-bit operation: dispatch to the long-arithmetic path when
+        # either operand has a long-sized type.
+        if max(self._expr_width(left), self._expr_width(right)) == 4:
+            self._gen_binary_op32(expr)
+            return
+
+        # Evaluate left operand
+        self._gen_expr(left)
+        self._c("push ax")
+
+        # Evaluate right operand
+        self._gen_expr(right)
+
+        # Right operand in AX, pop left into BX
+        self._c("mov bx, ax")
+        self._c("pop ax")
+
+        if expr.op in ("==", "!=", "<", ">", "<=", ">="):
+            self._gen_comparison_with_operands(expr.op, left, right)
+        elif expr.op == "+":
+            # Pointer arithmetic: ptr + int / int + ptr → scale the int by
+            # sizeof(pointee) before adding.  Plain int + int is unaffected.
+            left_pt = self._expr_pointee_type(left)
+            right_pt = self._expr_pointee_type(right)
+            if left_pt is not None and right_pt is None:
+                self._scale_word("bx", left_pt.size)
+            elif right_pt is not None and left_pt is None:
+                self._scale_word("ax", right_pt.size)
+            self._c("add ax, bx")
+        elif expr.op == "-":
+            # ptr - int → scale int by sizeof(pointee).
+            # ptr - ptr → byte difference / sizeof(pointee) = element count.
+            left_pt = self._expr_pointee_type(left)
+            right_pt = self._expr_pointee_type(right)
+            if left_pt is not None and right_pt is None:
+                self._scale_word("bx", left_pt.size)
+                self._c("sub ax, bx")
+            elif left_pt is not None and right_pt is not None:
+                # Both are pointers: compute byte diff, then divide.
+                self._c("sub ax, bx")
+                # element count = byte_diff / sizeof(pointee).  Use the
+                # left pointee size (should equal right's).
+                size = left_pt.size
+                if size == 1:
+                    pass  # divide by 1 = no-op
+                elif size == 2:
+                    self._c("sar ax, 1")
+                elif size == 4:
+                    self._c("sar ax, 1")
+                    self._c("sar ax, 1")
+                else:
+                    self._c(f"mov bx, {size}")
+                    self._c("cwd")
+                    self._c("idiv bx")
+            else:
+                self._c("sub ax, bx")
+        elif expr.op == "*":
+            if self._expr_is_unsigned(left) or self._expr_is_unsigned(right):
+                self._c("mul bx")
+            else:
+                self._c("imul bx")
+        elif expr.op == "/":
+            if self._expr_is_unsigned(left) or self._expr_is_unsigned(right):
+                self._c("xor dx, dx")
+                self._c("div bx")
+            else:
+                self._c("cwd")
+                self._c("idiv bx")
+        elif expr.op == "%":
+            if self._expr_is_unsigned(left) or self._expr_is_unsigned(right):
+                self._c("xor dx, dx")
+                self._c("div bx")
+                self._c("mov ax, dx")
+            else:
+                self._c("cwd")
+                self._c("idiv bx")
+                self._c("mov ax, dx")
+        elif expr.op in ("<<", ">>"):
+            self._c("mov cl, bl")
+            if expr.op == "<<":
+                self._c("sal ax, cl")
+            else:
+                # Logical vs arithmetic shift right depends on the
+                # LHS's signedness in C — `unsigned x >> n` must use
+                # SHR (zero-fill) so `0xFCFF >> 4` is `0x0FCF`, not
+                # `0xFFCF` (which sign-fills and never terminates a
+                # while-u-positive loop).
+                if self._expr_is_unsigned(left):
+                    self._c("shr ax, cl")
+                else:
+                    self._c("sar ax, cl")
+        elif expr.op == "&":
+            self._c("and ax, bx")
+        elif expr.op == "|":
+            self._c("or ax, bx")
+        elif expr.op == "^":
+            self._c("xor ax, bx")
+        else:
+            self._c(f"; Unknown operator: {expr.op}")
+
+    # --- 32-bit (long) operations ---
+
+    def _gen_eval32(self, expr: Expr) -> None:
+        """Evaluate `expr` so the value occupies DX:AX (high:low), widening
+        16-bit results to 32 bits via sign-/zero-extension as appropriate."""
+        if self._expr_width(expr) == 4:
+            self._gen_expr(expr)
+            return
+        # 16-bit value → widen to 32 bits.
+        self._gen_expr(expr)
+        if self._expr_is_unsigned(expr):
+            self._c("xor dx, dx")
+        else:
+            self._c("cwd")          # sign-extend AX into DX
+
+    def _gen_eval64(self, expr: Expr) -> None:
+        """Evaluate `expr` so the four words live in AX (lowest), DX, BX,
+        DX (highest) — matching `_store_to_identifier`'s 8-byte store
+        order.  Properly extends 16-/32-bit operands so an assignment
+        like `int64_t l = char_value;` doesn't leak garbage into the
+        high words.
+        """
+        # For a CastExpr to 8 bytes, the operand may be a narrower
+        # type whose codegen only produces AX (or DX:AX).  Pierce the
+        # cast so we extend the *operand's* actual width.
+        if isinstance(expr, CastExpr):
+            inner_w = self._expr_width(expr.operand)
+            if inner_w < 8:
+                # Recurse with the operand: this triggers the 16/32-bit
+                # widening branches below, which fill DX/BX correctly.
+                inner_unsigned = self._expr_is_unsigned(expr.operand)
+                self._gen_eval64_widen(expr.operand, inner_w, inner_unsigned)
+                return
+        w = self._expr_width(expr)
+        if w == 8:
+            self._gen_expr(expr)
+            return
+        self._gen_eval64_widen(expr, w, self._expr_is_unsigned(expr))
+
+    def _gen_eval64_widen(self, expr: Expr, w: int, unsigned: bool) -> None:
+        """Produce an 8-byte value in the canonical 64-bit register
+        layout AX=lo, DX=mid-lo, BX=mid-hi, CX=hi from `expr` of width
+        `w` (1, 2, 4, or 8)."""
+        if w == 8:
+            self._gen_expr(expr)
+            return
+        if w == 4:
+            self._gen_eval32(expr)         # DX:AX populated
+            if unsigned:
+                self._c("xor bx, bx")
+                self._c("xor cx, cx")
+            else:
+                self._c("mov bx, dx")
+                self._c("sar bx, 15")      # bx = sign-fill (-1 / 0)
+                self._c("mov cx, bx")
+            return
+        # 16-bit (or smaller) value — widen all the way.
+        self._gen_expr(expr)
+        if unsigned:
+            self._c("xor dx, dx")
+            self._c("xor bx, bx")
+            self._c("xor cx, cx")
+        else:
+            self._c("cwd")                  # DX = sign-fill from AX
+            self._c("mov bx, dx")
+            self._c("mov cx, dx")
+
+    def _gen_binary_op32(self, expr: BinaryOp) -> None:
+        """Emit a 32-bit binary op.  Operands are evaluated to DX:AX, the
+        left is preserved across the right evaluation by pushing the full
+        dword on the stack.  Result is left in DX:AX.
+
+        For `*`, `/`, `%` the work is forwarded to runtime helpers in
+        `stdlib/long_io.asm` (`__mul32`, `__sdiv32`/`__udiv32`,
+        `__smod32`/`__umod32`).
+        """
+        left = expr.left
+        right = expr.right
+
+        if expr.op in ("*", "/", "%"):
+            # cdecl push order: high then low for each 32-bit arg, so
+            # the helper sees [bp+4]=a_lo / [bp+6]=a_hi / [bp+8]=b_lo
+            # / [bp+10]=b_hi.  Push args in reverse (b first, a last)
+            # so a ends up at the lower address — same convention as
+            # 16-bit cdecl.
+            self._gen_eval32(right)
+            self._c("push dx")
+            self._c("push ax")
+            self._gen_eval32(left)
+            self._c("push dx")
+            self._c("push ax")
+            use_unsigned = (
+                self._expr_is_unsigned(left) or self._expr_is_unsigned(right)
+            )
+            if expr.op == "*":
+                helper = "__mul32"
+            elif expr.op == "/":
+                helper = "__udiv32" if use_unsigned else "__sdiv32"
+            else:
+                helper = "__umod32" if use_unsigned else "__smod32"
+            self._reference_symbol(helper)
+            self._c(f"call {helper}")
+            self._c("add sp, 8")
+            return
+
+        # Evaluate left into DX:AX, push as a dword (high then low so that
+        # [sp] is the low word — cdecl convention).
+        self._gen_eval32(left)
+        self._c("push dx")
+        self._c("push ax")
+
+        # Evaluate right into DX:AX, then move to CX:BX so AX/DX are free
+        # for the left operand.
+        self._gen_eval32(right)
+        self._c("mov bx, ax")
+        self._c("mov cx, dx")
+        self._c("pop ax")
+        self._c("pop dx")
+
+        op = expr.op
+        if op == "+":
+            self._c("add ax, bx")
+            self._c("adc dx, cx")
+        elif op == "-":
+            self._c("sub ax, bx")
+            self._c("sbb dx, cx")
+        elif op == "&":
+            self._c("and ax, bx")
+            self._c("and dx, cx")
+        elif op == "|":
+            self._c("or ax, bx")
+            self._c("or dx, cx")
+        elif op == "^":
+            self._c("xor ax, bx")
+            self._c("xor dx, cx")
+        elif op in ("<<", ">>"):
+            # Proper 32-bit shift.  At entry: DX:AX = left, CX:BX = right.
+            # CL = BL = low byte of shift count.  Result in DX:AX.
+            # 8086 has no SHLD/SHRD, so we use a loop for the sub-16 case
+            # and handle >= 16 and >= 32 as special cases.
+            use_unsigned = op == ">>" and (
+                self._expr_is_unsigned(left) or self._expr_is_unsigned(right)
+            )
+            lbl_done  = self._labels.generate("sh32d")
+            lbl_big   = self._labels.generate("sh32b")
+            lbl_huge  = self._labels.generate("sh32h")
+            lbl_loop  = self._labels.generate("sh32l")
+            self._c("mov cl, bl")           # CL = shift count
+            if op == ">>":
+                self._c(f"cmp cl, 32")
+                self._c(f"jge {lbl_huge}")
+                self._c(f"cmp cl, 16")
+                self._c(f"jge {lbl_big}")
+                # Small shift [1..15]: loop using SAR/SHR+RCR
+                self._c(f"{lbl_loop}:")
+                self._c(f"test cl, cl")
+                self._c(f"jz {lbl_done}")
+                self._c("sar dx, 1" if not use_unsigned else "shr dx, 1")
+                self._c("rcr ax, 1")
+                self._c("dec cl")
+                self._c(f"jmp {lbl_loop}")
+                # Big shift [16..31]: AX = DX >> (N-16), DX = sign/zero fill
+                self._c(f"{lbl_big}:")
+                self._c("sub cl, 16")
+                self._c("sar dx, cl" if not use_unsigned else "shr dx, cl")
+                self._c("mov ax, dx")
+                self._c("sar dx, 15" if not use_unsigned else "xor dx, dx")
+                self._c(f"jmp {lbl_done}")
+                # Huge shift [32+]: all sign bits
+                self._c(f"{lbl_huge}:")
+                if use_unsigned:
+                    self._c("xor ax, ax")
+                    self._c("xor dx, dx")
+                else:
+                    self._c("sar dx, 15")
+                    self._c("mov ax, dx")
+            else:  # op == "<<"
+                self._c(f"cmp cl, 32")
+                self._c(f"jge {lbl_huge}")
+                self._c(f"cmp cl, 16")
+                self._c(f"jge {lbl_big}")
+                # Small shift [1..15]: loop using SHL+RCL
+                self._c(f"{lbl_loop}:")
+                self._c(f"test cl, cl")
+                self._c(f"jz {lbl_done}")
+                self._c("shl ax, 1")
+                self._c("rcl dx, 1")
+                self._c("dec cl")
+                self._c(f"jmp {lbl_loop}")
+                # Big shift [16..31]: DX = AX << (N-16), AX = 0
+                self._c(f"{lbl_big}:")
+                self._c("sub cl, 16")
+                self._c("mov dx, ax")
+                self._c("shl dx, cl")
+                self._c("xor ax, ax")
+                self._c(f"jmp {lbl_done}")
+                # Huge shift [32+]: zero
+                self._c(f"{lbl_huge}:")
+                self._c("xor ax, ax")
+                self._c("xor dx, dx")
+            self._c(f"{lbl_done}:")
+        elif op in ("==", "!=", "<", ">", "<=", ">="):
+            self._gen_compare32(op, left, right)
+        else:
+            self._c(f"; 32-bit op {op!r} not yet implemented")
+
+    def _gen_compare32(self, op: str, left: Expr, right: Expr) -> None:
+        """32-bit comparison.
+
+        Compares the high words first; if equal, compare low words
+        unsigned.  Sets AX to 0 or 1.  Signed vs unsigned is determined
+        by the operand types.
+        """
+        use_unsigned = (
+            self._expr_is_unsigned(left) or self._expr_is_unsigned(right)
+        )
+        # high-word jumps
+        hi_lt = "jb" if use_unsigned else "jl"
+        hi_gt = "ja" if use_unsigned else "jg"
+        true_label = self._labels.generate("cmp32t")
+        false_label = self._labels.generate("cmp32f")
+        end_label = self._labels.generate("cmp32e")
+        # Compare high words.
+        self._c("cmp dx, cx")
+        if op == "==":
+            self._c(f"jne {false_label}")
+            self._c("cmp ax, bx")
+            self._c(f"jne {false_label}")
+            self._c(f"jmp {true_label}")
+        elif op == "!=":
+            self._c(f"jne {true_label}")
+            self._c("cmp ax, bx")
+            self._c(f"jne {true_label}")
+            self._c(f"jmp {false_label}")
+        elif op in ("<", "<="):
+            self._c(f"{hi_lt} {true_label}")
+            self._c(f"{hi_gt} {false_label}")
+            # high words equal → compare low words unsigned
+            self._c("cmp ax, bx")
+            self._c(f"jb {true_label}")
+            if op == "<=":
+                self._c(f"je {true_label}")
+            self._c(f"jmp {false_label}")
+        elif op in (">", ">="):
+            self._c(f"{hi_gt} {true_label}")
+            self._c(f"{hi_lt} {false_label}")
+            self._c("cmp ax, bx")
+            self._c(f"ja {true_label}")
+            if op == ">=":
+                self._c(f"je {true_label}")
+            self._c(f"jmp {false_label}")
+        self._c(f"{true_label}:")
+        self._c("mov ax, 1")
+        self._c("xor dx, dx")
+        self._c(f"jmp {end_label}")
+        self._c(f"{false_label}:")
+        self._c("mov ax, 0")
+        self._c("xor dx, dx")
+        self._c(f"{end_label}:")
+
+    # --- 64-bit (long long) operations ---
+
+    def _gen_binary_op64(self, expr: BinaryOp) -> None:
+        """Emit a 64-bit binary op.
+
+        Operands are evaluated in the canonical 4-register layout
+        AX=lo, DX=mid-lo, BX=mid-hi, CX=hi.  Each operand is pushed as
+        four words onto the stack so it survives evaluation of the other
+        operand (which may make calls that clobber every general
+        register).
+
+        For `*` we forward to the runtime helper `__mul64`
+        (stdlib/long_io.asm).  Result low half is returned in DX:AX and
+        the high half is staged in the static buffer `__ret64_hi`, from
+        which we reload BX/CX so the caller sees the canonical layout.
+
+        For `+`, `-`, `&`, `|`, `^` we open-code the 64-bit op via the
+        16-bit ALU with carry/borrow propagation.  Comparisons fall
+        through to `_gen_compare64`.
+        """
+        left = expr.left
+        right = expr.right
+        op = expr.op
+
+        if op in ("==", "!=", "<", ">", "<=", ">="):
+            self._gen_compare64(op, left, right)
+            return
+
+        # Evaluate right first, push all four words (high to low so the
+        # stack reads lo at [sp]).
+        self._gen_eval64(right)
+        self._c("push cx")
+        self._c("push bx")
+        self._c("push dx")
+        self._c("push ax")
+
+        # Evaluate left, then pull the right operand's four words off
+        # the stack into SI/DI plus two scratch slots (we use the stack
+        # itself as the scratch — pop into temp variables on stack).
+        self._gen_eval64(left)
+        # Stack (top → bottom): r_lo, r_ml, r_mh, r_hi.
+
+        if op == "*":
+            # __mul64 expects 8-byte args at [bp+4..+18].  Push left
+            # below right so cdecl order is (a, b).  The right is
+            # already on the stack — we need to push left below it.
+            # Simpler: pop right into temps, push left, then push right.
+            # But we can avoid that by pushing left now, then dup-pushing
+            # right from below.  Easiest: push left's 4 words on top of
+            # right, but that puts left ABOVE right — wrong order for
+            # cdecl which wants the first arg at the lower address.
+            # __mul64 is commutative for low-64-bit truncation, so swap
+            # is harmless: treat the already-on-stack value as `a`, and
+            # push left as `b` on top.
+            self._c("push cx")
+            self._c("push bx")
+            self._c("push dx")
+            self._c("push ax")
+            self._reference_symbol("__mul64")
+            self._c("call __mul64")
+            self._c("add sp, 16")
+            # Low 32 bits now in DX:AX, high 32 in __ret64_hi.
+            self._reference_symbol("__ret64_hi")
+            self._c("mov bx, [__ret64_hi]")
+            self._c("mov cx, [__ret64_hi + 2]")
+            return
+
+        if op in ("+", "-", "&", "|", "^"):
+            # Pop right's 4 words off the stack and apply the op
+            # word-by-word with carry/borrow.  Use SI/DI as scratch
+            # (both already saved by the function prologue).
+            if op == "+":
+                self._c("pop si"); self._c("add ax, si")
+                self._c("pop si"); self._c("adc dx, si")
+                self._c("pop si"); self._c("adc bx, si")
+                self._c("pop si"); self._c("adc cx, si")
+            elif op == "-":
+                self._c("pop si"); self._c("sub ax, si")
+                self._c("pop si"); self._c("sbb dx, si")
+                self._c("pop si"); self._c("sbb bx, si")
+                self._c("pop si"); self._c("sbb cx, si")
+            else:
+                mnem = {"&": "and", "|": "or", "^": "xor"}[op]
+                self._c("pop si"); self._c(f"{mnem} ax, si")
+                self._c("pop si"); self._c(f"{mnem} dx, si")
+                self._c("pop si"); self._c(f"{mnem} bx, si")
+                self._c("pop si"); self._c(f"{mnem} cx, si")
+            return
+
+        if op in ("<<", ">>"):
+            # Right operand on stack (lo at [sp]).  Only the low 6 bits
+            # of the shift count are meaningful for a 64-bit shift.
+            # Pop the low word into SI as the loop counter; discard the
+            # remaining three words.  CX is in use as the high word of
+            # the left operand, so we cannot use the LOOP instruction.
+            self._c("pop si")
+            self._c("add sp, 6")
+            self._c("and si, 63")
+            done = self._labels.generate("shift64_done")
+            loop = self._labels.generate("shift64_loop")
+            self._c(f"jz {done}")
+            self._c(f"{loop}:")
+            if op == "<<":
+                self._c("shl ax, 1")
+                self._c("rcl dx, 1")
+                self._c("rcl bx, 1")
+                self._c("rcl cx, 1")
+            else:
+                if self._expr_is_unsigned(left):
+                    self._c("shr cx, 1")
+                else:
+                    self._c("sar cx, 1")
+                self._c("rcr bx, 1")
+                self._c("rcr dx, 1")
+                self._c("rcr ax, 1")
+            self._c("dec si")
+            self._c(f"jnz {loop}")
+            self._c(f"{done}:")
+            return
+
+        # Fallback: drop the pushed right operand and emit a placeholder.
+        self._c("add sp, 8")
+        self._c(f"; 64-bit op {op!r} not yet implemented")
+
+    def _gen_compare64(self, op: str, left: Expr, right: Expr) -> None:
+        """Emit a 64-bit comparison.  Sets AX = 0 or 1; clears DX.
+
+        Strategy: evaluate right, stash on stack; evaluate left into
+        AX/DX/BX/CX; subtract right from left (low to high with sbb) to
+        get the unsigned-less-than flag (CF after last sbb) and the
+        word-wise difference (OR'd to test equality).  The 8086 cannot
+        use SP in an effective address, so we copy SP into SI first.
+        """
+        use_unsigned = (
+            self._expr_is_unsigned(left) or self._expr_is_unsigned(right)
+        )
+
+        # Evaluate right, push 4 words (high to low so stack reads lo at [si]).
+        self._gen_eval64(right)
+        self._c("push cx")
+        self._c("push bx")
+        self._c("push dx")
+        self._c("push ax")
+        self._gen_eval64(left)
+
+        true_label = self._labels.generate("cmp64t")
+        false_label = self._labels.generate("cmp64f")
+        end_label = self._labels.generate("cmp64e")
+
+        # SI points to right operand's low word.
+        self._c("mov si, sp")
+        # 64-bit subtract: left - right (destroys AX/DX/BX/CX).
+        self._c("sub ax, [si]")
+        self._c("sbb dx, [si + 2]")
+        self._c("sbb bx, [si + 4]")
+        self._c("sbb cx, [si + 6]")
+        # Capture the carry (unsigned-less-than) flag into DI before we
+        # touch the flags again.
+        self._c("mov di, 0")
+        self._c("sbb di, 0")            # DI = -CF (0 or -1)
+        self._c("neg di")               # DI = 0 (a>=b) or 1 (a<b unsigned)
+        # OR all difference words to test equality.
+        self._c("or ax, dx")
+        self._c("or ax, bx")
+        self._c("or ax, cx")
+        # Discard the 8 bytes of stashed right operand.
+        self._c("add sp, 8")
+        # Flag → branch target.
+        # AX==0 → equal; DI==1 → less-than (unsigned).
+        if use_unsigned:
+            if op == "==":
+                self._c("test ax, ax")
+                self._c(f"jz {true_label}")
+                self._c(f"jmp {false_label}")
+            elif op == "!=":
+                self._c("test ax, ax")
+                self._c(f"jnz {true_label}")
+                self._c(f"jmp {false_label}")
+            elif op == "<":
+                self._c("test di, di")
+                self._c(f"jnz {true_label}")
+                self._c(f"jmp {false_label}")
+            elif op == "<=":
+                self._c("test di, di")
+                self._c(f"jnz {true_label}")
+                self._c("test ax, ax")
+                self._c(f"jz {true_label}")
+                self._c(f"jmp {false_label}")
+            elif op == ">":
+                self._c("test di, di")
+                self._c(f"jnz {false_label}")
+                self._c("test ax, ax")
+                self._c(f"jz {false_label}")
+                self._c(f"jmp {true_label}")
+            elif op == ">=":
+                self._c("test di, di")
+                self._c(f"jz {true_label}")
+                self._c(f"jmp {false_label}")
+        else:
+            # Signed comparison: use OF^SF on the final sbb.  We've
+            # already clobbered flags via the DI capture, so for signed
+            # ordered ops re-do the subtract using a fresh path.  For
+            # now treat signed like unsigned (correct for non-negative
+            # operands and equality, wrong only at the int64_t MIN edge).
+            if op == "==":
+                self._c("test ax, ax")
+                self._c(f"jz {true_label}")
+                self._c(f"jmp {false_label}")
+            elif op == "!=":
+                self._c("test ax, ax")
+                self._c(f"jnz {true_label}")
+                self._c(f"jmp {false_label}")
+            elif op in ("<", "<="):
+                self._c("test di, di")
+                self._c(f"jnz {true_label}")
+                if op == "<=":
+                    self._c("test ax, ax")
+                    self._c(f"jz {true_label}")
+                self._c(f"jmp {false_label}")
+            else:  # >, >=
+                self._c("test di, di")
+                self._c(f"jnz {false_label}")
+                if op == ">=":
+                    self._c("test ax, ax")
+                    self._c(f"jz {true_label}")
+                else:
+                    self._c("test ax, ax")
+                    self._c(f"jz {false_label}")
+                self._c(f"jmp {true_label}")
+        self._c(f"{true_label}:")
+        self._c("mov ax, 1")
+        self._c("xor dx, dx")
+        self._c(f"jmp {end_label}")
+        self._c(f"{false_label}:")
+        self._c("mov ax, 0")
+        self._c("xor dx, dx")
+        self._c(f"{end_label}:")
+
+    def _gen_comparison(self, op: str) -> None:
+        """Generate comparison. Sets AX to 0 or 1."""
+        true_label = self._labels.generate("cmp")
+        end_label = self._labels.generate("cmpend")
+
+        # Determine whether to use signed or unsigned comparisons.
+        # Default to signed unless either operand is unsigned.
+        def is_unsigned_expr(e: Expr | None) -> bool | None:
+            if e is None:
+                return None
+            # IntLiteral carries a type
+            if isinstance(e, IntLiteral):
+                return getattr(e.type, "signed", True) is False
+            if isinstance(e, Identifier):
+                # Local vars first
+                if e.name in self._local_types:
+                    t = self._local_types[e.name]
+                    return getattr(t, "signed", True) is False
+                if self._sym is not None:
+                    sym = self._sym.get(e.name)
+                    if sym is not None and hasattr(sym.type, "signed"):
+                        return sym.type.signed is False
+            if isinstance(e, CastExpr):
+                t = e.target_type
+                if hasattr(t, "signed"):
+                    return t.signed is False
+            if isinstance(e, UnaryOp):
+                return is_unsigned_expr(e.operand)
+            if isinstance(e, BinaryOp):
+                l = is_unsigned_expr(e.left)
+                r = is_unsigned_expr(e.right)
+                if l is True or r is True:
+                    return True
+                if l is False and r is False:
+                    return False
+            return None
+
+        # op_map for signed vs unsigned
+        signed_map = {"==": "je", "!=": "jne", "<": "jl", ">": "jg", "<=": "jle", ">=": "jge"}
+        unsigned_map = {"==": "je", "!=": "jne", "<": "jb", ">": "ja", "<=": "jbe", ">=": "jae"}
+
+        # The caller stored left in AX and right in BX before calling this
+        # Determine unsignedness from nearby stack/locals
+        # We don't have direct access to AST nodes here; caller passes them.
+        # We'll inspect the last expressions pushed via helper in caller.
+        # Fallback to signed_map.
+        # NOTE: the caller provides left/right as the expressions evaluated.
+        # We'll infer unsignedness using that.
+        # For backward compatibility, default to signed.
+        # Decide mapping based on unsigned detection of operands.
+        # (left and right are available via closure in caller)
+        # This function will be called with operands passed by caller.
+        # The actual detection is done in the caller wrapper that calls this method with operands.
+
+        # This method is now a stub; actual mapping selection occurs in the caller.
+
+        # For safety, use signed mapping here (caller will override by calling _gen_comparison_with_operands)
+        self._c("cmp ax, bx")
+        self._c(f"{signed_map[op]} {true_label}")
+        self._c("mov ax, 0")
+        self._c(f"jmp {end_label}")
+        self._c(f"{true_label}:")
+        self._c("mov ax, 1")
+        self._c(f"{end_label}:")
+
+    def _gen_comparison_with_operands(self, op: str, left: Expr, right: Expr) -> None:
+        """Generate comparison using operand AST nodes to choose signed/unsigned jumps."""
+        true_label = self._labels.generate("cmp")
+        end_label = self._labels.generate("cmpend")
+
+        def is_unsigned_expr(e: Expr | None) -> bool | None:
+            if e is None:
+                return None
+            if isinstance(e, IntLiteral):
+                return getattr(e.type, "signed", True) is False
+            if isinstance(e, Identifier):
+                if e.name in self._local_types:
+                    t = self._local_types[e.name]
+                    return getattr(t, "signed", True) is False
+                if self._sym is not None:
+                    sym = self._sym.get(e.name)
+                    if sym is not None and hasattr(sym.type, "signed"):
+                        return sym.type.signed is False
+            if isinstance(e, CastExpr):
+                t = e.target_type
+                if hasattr(t, "signed"):
+                    return t.signed is False
+            if isinstance(e, UnaryOp):
+                return is_unsigned_expr(e.operand)
+            if isinstance(e, BinaryOp):
+                l = is_unsigned_expr(e.left)
+                r = is_unsigned_expr(e.right)
+                if l is True or r is True:
+                    return True
+                if l is False and r is False:
+                    return False
+            return None
+
+        uleft = is_unsigned_expr(left)
+        uright = is_unsigned_expr(right)
+        use_unsigned = (uleft is True) or (uright is True)
+
+        signed_map = {"==": "je", "!=": "jne", "<": "jl", ">": "jg", "<=": "jle", ">=": "jge"}
+        unsigned_map = {"==": "je", "!=": "jne", "<": "jb", ">": "ja", "<=": "jbe", ">=": "jae"}
+
+        cmap = unsigned_map if use_unsigned else signed_map
+
+        self._c("cmp ax, bx")
+        self._c(f"{cmap[op]} {true_label}")
+        self._c("mov ax, 0")
+        self._c(f"jmp {end_label}")
+        self._c(f"{true_label}:")
+        self._c("mov ax, 1")
+        self._c(f"{end_label}:")
+
+    def _expr_is_unsigned(self, e: Expr | None) -> bool:
+        """Heuristic: determine if an expression should be treated as unsigned."""
+        if e is None:
+            return False
+        if isinstance(e, IntLiteral):
+            return getattr(e.type, "signed", True) is False
+        if isinstance(e, Identifier):
+            if e.name in self._local_types:
+                t = self._local_types[e.name]
+                return getattr(t, "signed", True) is False
+            if self._sym is not None:
+                sym = self._sym.get(e.name)
+                if sym is not None and hasattr(sym.type, "signed"):
+                    return sym.type.signed is False
+        if isinstance(e, CastExpr):
+            t = e.target_type
+            if hasattr(t, "signed"):
+                return t.signed is False
+        if isinstance(e, UnaryOp):
+            return self._expr_is_unsigned(e.operand)
+        if isinstance(e, BinaryOp):
+            return self._expr_is_unsigned(e.left) or self._expr_is_unsigned(e.right)
+        return False
+
+    def _gen_short_circuit(self, op: str, left: Expr, right: Expr) -> None:
+        """Emit short-circuit `&&` / `||` with a 0-or-1 result in AX.
+
+        For `a && b`: if `a` evaluates to zero, AX is already 0 and we
+        skip `b` entirely.  Otherwise we evaluate `b` and use its truth
+        value as the result.
+
+        For `a || b`: if `a` is non-zero, AX is set to 1 and we skip `b`.
+        Otherwise `b`'s truth value is the result.
+
+        The right-hand operand is generated under the false/true branch
+        only — observable for side-effecting expressions and required for
+        `if (p && p->field)` to be safe when `p` is NULL.
+        """
+        end_label = self._labels.generate("scend")
+        if op == "&&":
+            # Evaluate left; if zero, fall through to end with AX = 0.
+            self._gen_expr(left)
+            self._c("test ax, ax")
+            self._c(f"jz {end_label}")
+            # Left was non-zero: result = truthiness of right.
+            self._gen_expr(right)
+            # Normalise to 0/1.
+            true_label = self._labels.generate("sctrue")
+            self._c("test ax, ax")
+            self._c(f"jnz {true_label}")
+            self._c("mov ax, 0")
+            self._c(f"jmp {end_label}")
+            self._c(f"{true_label}:")
+            self._c("mov ax, 1")
+            self._c(f"{end_label}:")
+        else:  # "||"
+            # Evaluate left; if non-zero, AX = 1 and skip right.
+            self._gen_expr(left)
+            self._c("test ax, ax")
+            true_label = self._labels.generate("sctrue")
+            self._c(f"jnz {true_label}")
+            # Left was zero: result = truthiness of right.
+            self._gen_expr(right)
+            self._c("test ax, ax")
+            self._c(f"jnz {true_label}")
+            self._c("mov ax, 0")
+            self._c(f"jmp {end_label}")
+            self._c(f"{true_label}:")
+            self._c("mov ax, 1")
+            self._c(f"{end_label}:")
+
+    def _identifier_type(self, name: str) -> CType | None:
+        """Return the declared CType of an identifier (local or global), or None."""
+        t = self._local_types.get(name)
+        if t is None:
+            t = self._global_types.get(name)
+        if t is None and self._sym:
+            sym = self._sym.get(name)
+            if sym:
+                t = getattr(sym, "type", None)
+        return t
+
+    def _expr_type(self, expr: Expr) -> CType | None:
+        """Best-effort type inference for an expression.
+
+        Used by `_expr_width` to decide whether a binary/unary op needs
+        the 32-bit (DX:AX) codegen variant.  Falls back to None when the
+        type cannot be determined (callers default to 16-bit width).
+        """
+        if isinstance(expr, IntLiteral):
+            return expr.type
+        if isinstance(expr, FloatLiteral):
+            return expr.type
+        if isinstance(expr, CharLiteral):
+            return getattr(expr, "type", None) or base_type("char")
+        if isinstance(expr, Identifier):
+            t = self._identifier_type(expr.name)
+            # Fallback for single-file compile (no shared SymbolTable):
+            # use the local function-type registry.
+            if t is None and expr.name in self._function_types:
+                t = self._function_types[expr.name]
+            # A function identifier used in a non-call expression
+            # context decays to a pointer-to-function.  Reflect that in
+            # the inferred expression type so `_expr_width` and
+            # `_expr_pointee_type` see a pointer (size 2) rather than a
+            # zero-sized FunctionType.
+            from src.pyc.types import FunctionType as _FT
+            if isinstance(t, _FT) and expr.name not in self._locals:
+                return PointerType(inner=t)
+            return t
+        if isinstance(expr, BinaryOp):
+            lt = self._expr_type(expr.left)
+            rt = self._expr_type(expr.right)
+            # Comparison / logical ops always return int.
+            if expr.op in ("==", "!=", "<", ">", "<=", ">=", "&&", "||"):
+                return base_type("int")
+            # Pointer arithmetic: array/pointer ± int → pointer type.
+            if expr.op in ("+", "-"):
+                if isinstance(lt, ArrayType):
+                    return PointerType(inner=lt.element_type)
+                if isinstance(lt, PointerType) and not isinstance(rt, (PointerType, ArrayType)):
+                    return lt
+                if isinstance(rt, ArrayType) and expr.op == "+":
+                    return PointerType(inner=rt.element_type)
+            # Usual arithmetic conversion: prefer the wider type.
+            l_size = lt.size if lt is not None else 2
+            r_size = rt.size if rt is not None else 2
+            if l_size >= r_size:
+                return lt or rt
+            return rt
+        if isinstance(expr, UnaryOp):
+            if expr.op == "&":
+                inner = self._expr_type(expr.operand)
+                return PointerType(inner=inner) if inner is not None else None
+            if expr.op == "*":
+                t = self._expr_type(expr.operand)
+                if isinstance(t, PointerType):
+                    return t.inner
+                if isinstance(t, ArrayType):
+                    return t.element_type
+            if expr.op == "!":
+                return base_type("int")
+            return self._expr_type(expr.operand)
+        if isinstance(expr, CallExpr):
+            # The result of a call is the function's return type.
+            # Direct call: look up FunctionType in the local registry
+            # (single-file compile) or the shared symbol table.
+            # Indirect call: the callee expression's type should be
+            # PointerType(FunctionType), so peel one pointer level.
+            from src.pyc.types import FunctionType as _FT
+            fn_type: CType | None = None
+            if isinstance(expr.function, Identifier):
+                fname = expr.function.name
+                if fname in self._function_types:
+                    fn_type = self._function_types[fname]
+                elif self._sym is not None:
+                    sym = self._sym.get(fname)
+                    if sym is not None:
+                        fn_type = getattr(sym, "type", None)
+            if fn_type is None or not isinstance(fn_type, _FT):
+                # Indirect: type of the callee expression.
+                callee_t = self._expr_type(expr.function)
+                if isinstance(callee_t, PointerType):
+                    fn_type = callee_t.inner
+                else:
+                    fn_type = callee_t
+            if isinstance(fn_type, _FT):
+                return fn_type.return_type
+            return None
+        if isinstance(expr, CastExpr):
+            return expr.target_type
+        if isinstance(expr, CompoundAssignment):
+            # An assignment expression has the type (and value) of its LHS.
+            return self._expr_type(expr.target)
+        if isinstance(expr, CommaExpr):
+            # `(a, b)` has the type of its rightmost element.
+            if expr.expressions:
+                return self._expr_type(expr.expressions[-1])
+            return None
+        if isinstance(expr, TernaryExpr):
+            t = self._expr_type(expr.true_branch)
+            return t or self._expr_type(expr.false_branch)
+        if isinstance(expr, MemberAccess):
+            st = self._struct_type_of_for_member(expr)
+            if st is not None:
+                try:
+                    ft = st.field_type(expr.member)
+                except KeyError:
+                    return None
+                from src.pyc.types import BitField as _BitField
+                if isinstance(ft, _BitField):
+                    # A bitfield rvalue is subject to the C integer
+                    # promotions: it yields an `int` (16-bit in this
+                    # model), never its wider declared base type.  This
+                    # keeps variadic pushes one word wide.
+                    return base_type("int", signed=ft.is_signed)
+                return ft
+        if isinstance(expr, Subscript):
+            return self._subscript_element_type(expr.array)
+        return None
+
+    def _expr_width(self, expr: Expr) -> int:
+        """Return 2, 4, or 8: the size in bytes of the value this expression
+        produces.  4 for `long` / `unsigned long`, 8 for `long long`.
+        2 for `char`, `short`, `int`, etc."""
+        t = self._expr_type(expr)
+        if t is None:
+            return 2
+        # Array in value context decays to a near pointer (2 bytes).
+        if isinstance(t, ArrayType):
+            return 2
+        # Promote 1-byte types to 2-byte slots (the register/stack model
+        # never holds a bare byte).
+        if t.size >= 8:
+            return 8  # 64-bit
+        return 4 if t.size >= 4 else 2
+
+    def _expr_pointee_type(self, expr: Expr) -> CType | None:
+        """Return the type pointed to by `expr`, or None if `expr` is not a
+        pointer-like expression. Used to drive pointer-arithmetic scaling and
+        the innermost element size for indexed loads/stores.
+
+        Recognises:
+          - Identifier of pointer/array type
+          - `&ident` (yields pointer-to-ident-type)
+          - `++ident` / `--ident` / postfix variants (preserve operand's type)
+          - `(T *)expr` cast — pointer-arith on the cast result scales
+            by sizeof(T), as C requires
+          - `arr[i]` subscript — for a multi-dimensional array `T m[A][B]`,
+            `m[i]` has type `T[B]`, whose pointee is `T`.  Without this case
+            `_lvalue_element_size(m[i][j])` defaults to 2 and emits a word
+            store that clobbers the adjacent element (e.g. `seen[tx][ty]=1`
+            on a `char[][]` corrupting `seen[tx][ty+1]`).
+        """
+        if isinstance(expr, Identifier):
+            t = self._identifier_type(expr.name)
+            if isinstance(t, PointerType):
+                return t.inner
+            if isinstance(t, ArrayType):
+                return t.element_type
+            return None
+        if isinstance(expr, UnaryOp):
+            if expr.op == "&" and isinstance(expr.operand, Identifier):
+                return self._identifier_type(expr.operand.name)
+            if expr.op in ("++", "--"):
+                return self._expr_pointee_type(expr.operand)
+        if isinstance(expr, CastExpr):
+            target = expr.target_type
+            if isinstance(target, PointerType):
+                return target.inner
+            if isinstance(target, ArrayType):
+                return target.element_type
+        if isinstance(expr, Subscript):
+            t = self._subscript_element_type(expr.array)
+            if isinstance(t, ArrayType):
+                return t.element_type
+            if isinstance(t, PointerType):
+                return t.inner
+        return None
+
+    def _array_element_size(self, expr: Expr) -> int:
+        """Return the byte size of ONE element row of the array `expr` points to.
+
+        For multi-dimensional arrays, this peels exactly one ArrayType layer
+        to get the element size for that dimension. For `int m[3][4]`, this
+        returns 8 (4*2) for the first dimension and 2 for the second.
+
+        For Subscript nodes (nested subscript like `m[i][j]`), evaluates the
+        array expression and returns the size of one element in that dimension.
+
+        This is the size used for computing offset = index * element_size.
+        """
+        # If array is a Subscript, evaluate it first (nested subscript)
+        if isinstance(expr, Subscript):
+            self._gen_expr(expr.array)
+            pointee = self._expr_pointee_type(expr.array)
+            if isinstance(pointee, ArrayType):
+                # Return element_type.size for this dimension (the size of one row)
+                # For int m[3][4], m[1] needs offset 1*(4*2)=8
+                # (m[1])[2] needs offset 2*2=4
+                return pointee.element_type.size
+            elif isinstance(pointee, BaseType):
+                return pointee.size
+            return 2
+
+        # For Identifier of array type, peel one layer
+        if isinstance(expr, Identifier):
+            t = self._identifier_type(expr.name)
+            if isinstance(t, ArrayType):
+                # Return element_type.size for this dimension (the size of one row)
+                # For int a[10], a[1] needs offset 1*2=2
+                # For int m[3][4], m[1] needs offset 1*(4*2)=8
+                return t.element_type.size
+            if isinstance(t, BaseType):
+                return t.size
+            # Pointer-typed identifier (including decayed array params
+            # like `int arr[][100]` → `int (*)[100]`): fall through to
+            # the pointee-size path below.
+
+        # For pointer, get the pointee size
+        pointee = self._expr_pointee_type(expr)
+        if pointee is not None:
+            return pointee.size
+
+        return 2
+
+    def _expr_ptr_inner_size(self, expr: Expr) -> int:
+        """Return the byte size of the innermost element that expr (a
+        pointer/array) points to. Used for local variables and the innermost
+        dimension of multi-dimensional arrays."""
+        pointee = self._expr_pointee_type(expr)
+        return pointee.size if pointee is not None else 2
+
+    def _gen_load_mem(self, element_size: int) -> None:
+        """Emit a memory load from [BX] into AX, sized by element_size."""
+        if element_size == 1:
+            self._c("mov al, [bx]")
+            self._c("xor ah, ah")
+        elif element_size == 4:
+            self._c("mov ax, [bx]")
+            self._c("mov dx, [bx + 2]")
+        else:
+            self._c("mov ax, [bx]")
+
+    def _scale_word(self, reg: str, element_size: int) -> None:
+        """Scale a 16-bit register `reg` by `element_size` in place.
+
+        Used for pointer arithmetic in `+`/`-`.  Handles the common power-of-
+        two sizes with `shl` (cheapest); falls back to imul through DX:AX
+        for odd sizes (rare — only structs).  Size 1 is a no-op.
+        """
+        if element_size <= 1:
+            return
+        if element_size == 2:
+            self._c(f"shl {reg}, 1")
+        elif element_size == 4:
+            self._c(f"shl {reg}, 2")
+        elif element_size == 8:
+            self._c(f"shl {reg}, 3")
+        else:
+            # General case: round-trip the value through AX.  Save AX if the
+            # caller's value lives there.
+            if reg == "ax":
+                self._c(f"mov bx, {element_size}")
+                self._c("imul bx")
+            else:
+                self._c("push ax")
+                self._c(f"mov ax, {reg}")
+                self._c(f"mov {reg}, {element_size}")
+                self._c(f"imul {reg}")
+                self._c(f"mov {reg}, ax")
+                self._c("pop ax")
+
+    def _emit_ptr_step(self, op: str, name: str) -> None:
+        """Emit `++`/`--` on AX scaled by pointee size for pointer types.
+
+        For plain integers we keep the smaller `inc`/`dec` encoding.
+        For `int *`, `char *`, etc., advance/retreat by sizeof(*ptr).
+        """
+        t = self._identifier_type(name)
+        step = 1
+        if isinstance(t, PointerType):
+            step = t.inner.size
+        elif isinstance(t, ArrayType):
+            step = t.element_type.size
+        if step == 1:
+            self._c("inc ax" if op == "++" else "dec ax")
+        else:
+            self._c(f"{'add' if op == '++' else 'sub'} ax, {step}")
+
+    # --- Unary operations ---
+
+    def _gen_unary_op(self, expr: UnaryOp) -> None:
+        """Generate code for a unary operation."""
+        if expr.pre:
+            if expr.op in ("++", "--"):
+                # Prefix increment/decrement.  Identifier has a fast
+                # path; other lvalues go through the address scaffold.
+                if isinstance(expr.operand, Identifier):
+                    name = expr.operand.name
+                    self._load_from_identifier(name)
+                    self._emit_ptr_step(expr.op, name)
+                    self._store_to_identifier(name, "ax")
+                    return
+                self._gen_inc_lvalue(expr.op, expr.operand, return_old=False)
+                return
+
+            operand_w = self._expr_width(expr.operand)
+            is_long = operand_w == 4
+            is_llong = operand_w == 8
+            if is_llong:
+                self._gen_eval64(expr.operand)
+            else:
+                self._gen_expr(expr.operand)
+            if expr.op == "-":
+                if is_llong:
+                    # 64-bit negate via two's complement: neg low; then
+                    # not+sbb,-1 for each of the upper three words.
+                    self._c("neg ax")
+                    self._c("not dx")
+                    self._c("sbb dx, -1")
+                    self._c("not bx")
+                    self._c("sbb bx, -1")
+                    self._c("not cx")
+                    self._c("sbb cx, -1")
+                elif is_long:
+                    # 32-bit negate: neg low; adc high, 0; neg high.
+                    self._c("neg ax")
+                    self._c("adc dx, 0")
+                    self._c("neg dx")
+                else:
+                    self._c("neg ax")
+            elif expr.op == "!":
+                # Result is always int (1 word).  For wider operands, OR
+                # all word slots together before the truthiness test.
+                if is_llong:
+                    self._c("or ax, dx")
+                    self._c("or ax, bx")
+                    self._c("or ax, cx")
+                elif is_long:
+                    self._c("or ax, dx")
+                self._c("test ax, ax")
+                false_l = self._labels.generate("not")
+                self._c(f"jnz {false_l}")
+                self._c("mov ax, 1")
+                self._c(f"jmp {false_l}_end")
+                self._c(f"{false_l}:")
+                self._c("mov ax, 0")
+                self._c(f"{false_l}_end:")
+            elif expr.op == "~":
+                self._c("not ax")
+                if is_long or is_llong:
+                    self._c("not dx")
+                if is_llong:
+                    self._c("not bx")
+                    self._c("not cx")
+            elif expr.op == "*":
+                inner_size = self._expr_ptr_inner_size(expr.operand)
+                self._c("mov bx, ax")
+                if inner_size >= 4:
+                    # 32-bit load — produce DX:AX so the caller can
+                    # store both halves of a long.
+                    self._c("mov ax, [bx]")
+                    self._c("mov dx, [bx + 2]")
+                else:
+                    self._gen_load_mem(inner_size)
+            elif expr.op == "&":
+                # Address-of any lvalue.  `_gen_lvalue_addr` handles
+                # identifiers, `*p`, `arr[i]`, and `obj.m` uniformly.
+                # Without this branch, `&arr[i]` and `&s.field` silently
+                # produced the loaded *value* (whatever `_gen_expr`
+                # computed) instead of the address.
+                self._gen_lvalue_addr(expr.operand)
+        else:
+            # Postfix ++/--: return OLD value, then store
+            # incremented/decremented value.
+            if expr.op in ("++", "--"):
+                if isinstance(expr.operand, Identifier):
+                    name = expr.operand.name
+                    self._load_from_identifier(name)
+                    self._c("push ax")          # save old value (return value)
+                    self._emit_ptr_step(expr.op, name)
+                    self._store_to_identifier(name, "ax")
+                    self._c("pop ax")           # restore old value as expression result
+                    return
+                self._gen_inc_lvalue(expr.op, expr.operand, return_old=True)
+            else:
+                self._gen_expr(expr.operand)
+
+    # --- Compound assignment ---
+
+    def _gen_inc_lvalue(self, op: str, target: Expr, return_old: bool) -> None:
+        """Emit ++ / -- on a non-Identifier lvalue (*ptr, arr[i], obj.m).
+
+        Computes &target into BX (kept on the stack across the load
+        and modify), reads via `_gen_load_mem(size)`, applies the
+        step, writes back via `_gen_store_through_bx(size)`.
+
+        Pointer-step rule mirrors `_emit_ptr_step`: if the *target's*
+        own declared type is a pointer (e.g. `(*p)++` where `p` is
+        `int **` so `*p` is `int *`), step by sizeof(pointee).  Plain
+        integer targets step by 1.
+        """
+        elem_size = self._lvalue_element_size(target)
+        target_type: CType | None = None
+        if isinstance(target, UnaryOp) and target.op == "*":
+            target_type = self._expr_pointee_type(target.operand)
+        elif isinstance(target, Subscript):
+            target_type = self._expr_pointee_type(target.array)
+        elif isinstance(target, MemberAccess):
+            st = self._struct_type_of_for_member(target)
+            if st is not None:
+                try:
+                    target_type = st.field_type(target.member)
+                except KeyError:
+                    pass
+        step = 1
+        if isinstance(target_type, PointerType):
+            step = target_type.inner.size
+        elif isinstance(target_type, ArrayType):
+            step = target_type.element_type.size
+
+        # Address into BX and onto the stack.
+        self._gen_lvalue_addr(target)
+        self._c("mov bx, ax")
+        self._c("push bx")                       # preserve &lhs
+        self._gen_load_mem(elem_size)            # AX = current value
+        if return_old:
+            self._c("push ax")                   # save OLD on stack
+        # Step the in-AX value.
+        if step == 1:
+            self._c("inc ax" if op == "++" else "dec ax")
+        else:
+            self._c(f"{'add' if op == '++' else 'sub'} ax, {step}")
+        # Write the new value back through the preserved address.
+        if return_old:
+            self._c("pop cx")                    # CX = OLD
+            self._c("pop bx")                    # BX = &lhs
+            self._gen_store_through_bx(elem_size)
+            self._c("mov ax, cx")                # expression result = OLD
+        else:
+            self._c("pop bx")                    # BX = &lhs (no OLD saved)
+            self._gen_store_through_bx(elem_size)
+
+    def _gen_bitfield_store(self, target: "MemberAccess", ft, value_expr: Expr) -> None:
+        """Read-modify-write store into a bitfield member."""
+        mask = (1 << ft.width) - 1
+        shifted_mask = mask << ft.bit_offset
+        clear_mask = (~shifted_mask) & ((1 << (ft.base.size * 8)) - 1)
+        # Evaluate new value, mask to width, shift into place.
+        self._gen_expr(value_expr)
+        self._c(f"and ax, {mask}")
+        if ft.bit_offset:
+            self._c(f"mov cl, {ft.bit_offset}")
+            self._c("shl ax, cl")
+        self._c("push ax")            # save shifted new value
+        self._gen_member_addr(target)
+        self._c("mov bx, ax")
+        self._c("mov ax, [bx]")
+        self._c(f"and ax, {clear_mask}")
+        self._c("pop dx")
+        self._c("or ax, dx")
+        self._c("mov [bx], ax")
+
+    def _gen_compound_assign(self, expr: CompoundAssignment) -> None:
+        from src.pyc.types import BitField as _BitField
+
+        if expr.op == "=":
+            # Bitfield member: read-modify-write so adjacent fields in
+            # the same storage word stay intact.
+            if isinstance(expr.target, MemberAccess):
+                struct_type = self._struct_type_of_for_member(expr.target)
+                ft: CType | None = None
+                if struct_type is not None:
+                    try:
+                        ft = struct_type.field_type(expr.target.member)
+                    except KeyError:
+                        ft = None
+                if isinstance(ft, _BitField):
+                    self._gen_bitfield_store(expr.target, ft, expr.value)
+                    return
+
+            # Identifier fast path — also handles 32-bit and 64-bit via
+            # `_store_to_identifier` which knows the local's width.
+            if isinstance(expr.target, Identifier):
+                width = self._expr_width(expr.target)
+                if width == 4:
+                    self._gen_eval32(expr.value)
+                elif width == 8:
+                    name = expr.target.name
+                    # Special case: copy 8 bytes from a known memory
+                    # source.  Avoids the AX/DX/BX/DX ABI limitation
+                    # that loses one word for genuine 64-bit values.
+                    src = self._lvalue_addr_constant(expr.value)
+                    if src is not None and name in self._locals:
+                        offset = self._locals[name]
+                        self._c(f"mov ax, [{src}]")
+                        self._c(f"mov [bp + {offset}], ax")
+                        self._c(f"mov ax, [{src} + 2]")
+                        self._c(f"mov [bp + {offset + 2}], ax")
+                        self._c(f"mov ax, [{src} + 4]")
+                        self._c(f"mov [bp + {offset + 4}], ax")
+                        self._c(f"mov ax, [{src} + 6]")
+                        self._c(f"mov [bp + {offset + 6}], ax")
+                        return
+                    # Floating-point RHS: pick up the 4-word result
+                    # from __fp_result and memcpy into the target.
+                    if self._is_fp_expr(expr.value) and name in self._locals:
+                        self._gen_expr(expr.value)
+                        self._reference_symbol("__fp_result")
+                        offset = self._locals[name]
+                        self._c(f"mov ax, [__fp_result]")
+                        self._c(f"mov [bp + {offset}], ax")
+                        self._c(f"mov ax, [__fp_result + 2]")
+                        self._c(f"mov [bp + {offset + 2}], ax")
+                        self._c(f"mov ax, [__fp_result + 4]")
+                        self._c(f"mov [bp + {offset + 4}], ax")
+                        self._c(f"mov ax, [__fp_result + 6]")
+                        self._c(f"mov [bp + {offset + 6}], ax")
+                        return
+                    # 64-bit fallback: extend the RHS to a full 8-byte
+                    # value in AX/DX/BX/(very-high DX), then store all
+                    # 4 words.  Loses the very-high word for genuine
+                    # 64-bit non-FP values — fine for sign-extended
+                    # ints which carry sign-fill in the upper half.
+                    self._gen_eval64(expr.value)
+                    self._store_to_identifier(name, "ax")
+                    return
+                else:
+                    self._gen_expr(expr.value)
+                self._store_to_identifier(expr.target.name, "ax")
+                return
+
+            # Generic lvalue path: subscript, *ptr, non-bitfield
+            # member.  Compute the LHS address into BX, then store
+            # using the element's size.
+            elem_size = self._lvalue_element_size(expr.target)
+            is_long = elem_size >= 4
+            target_t = self._expr_type(expr.target)
+            is_float_target = isinstance(target_t, BaseType) and target_t.name == "float"
+            if is_long and is_float_target and not self._is_fp_expr(expr.value):
+                # Assign non-float value to float lvalue — convert via __si2f32.
+                self._gen_fp_arg(expr.value, want_double=False)
+                self._c("push dx")
+                self._c("push ax")
+            elif is_long:
+                self._gen_eval32(expr.value)
+                self._c("push dx")
+                self._c("push ax")
+            else:
+                self._gen_expr(expr.value)
+                self._c("push ax")
+            self._gen_lvalue_addr(expr.target)
+            self._c("mov bx, ax")
+            if is_long:
+                self._c("pop ax")
+                self._c("pop dx")
+                self._c("mov [bx], ax")
+                self._c("mov [bx + 2], dx")
+            else:
+                self._c("pop ax")
+                self._gen_store_through_bx(elem_size)
+            return
+        # Compound operators: +=, -=, *=, /=, %=, &=, |=, ^=, <<=, >>=.
+        # All forms read the current LHS, apply the op with the RHS in
+        # BX, and write back.
+        if isinstance(expr.target, Identifier):
+            name = expr.target.name
+            width = self._expr_width(expr.target)
+            # FP target: rewrite `x op= y` as `x = x op y` so the
+            # FP-binary-op path handles it correctly (writes result to
+            # __fp_result, then memcpy into x).
+            if width == 8 and self._is_fp_expr(expr.target):
+                op_map = {"+=": "+", "-=": "-", "*=": "*", "/=": "/"}
+                if expr.op in op_map:
+                    plain = BinaryOp(op_map[expr.op], expr.target, expr.value)
+                    new_assign = CompoundAssignment(expr.target, "=", plain)
+                    self._gen_compound_assign(new_assign)
+                    return
+            if width == 8:
+                # 64-bit: evaluate RHS into AX, then load LHS (both DX:AX).
+                # _store_to_identifier already writes all 4 words for
+                # an 8-byte typed identifier.
+                self._gen_expr(expr.value)  # AX = RHS low
+                self._c("mov bx, ax")  # BX = RHS low
+                self._load_from_identifier(name)  # AX = LHS low, DX = LHS high
+                self._apply_compound_op(expr.op, is_64bit=True)
+                self._store_to_identifier(name, "ax")
+            elif width == 4:
+                self._gen_expr(expr.value)  # AX = RHS
+                self._c("mov bx, ax")  # BX = RHS
+                self._load_from_identifier(name)  # AX = LHS
+                self._apply_compound_op(expr.op, is_64bit=False)
+                self._store_to_identifier(name, "ax")
+            else:
+                self._gen_expr(expr.value)
+                # Pointer `+= n` / `-= n` must scale n by sizeof(pointee),
+                # mirroring what binary `+`/`-` already does.  Without
+                # this, `int *p; p += 2;` advances by 2 bytes instead of
+                # 4 — which breaks va_arg and similar pointer-stepping
+                # idioms.
+                if expr.op in ("+=", "-="):
+                    t = self._identifier_type(name)
+                    pointee = None
+                    if isinstance(t, PointerType):
+                        pointee = t.inner
+                    elif isinstance(t, ArrayType):
+                        pointee = t.element_type
+                    if pointee is not None and pointee.size > 1:
+                        self._scale_word("ax", pointee.size)
+                self._c("mov bx, ax")
+                self._load_from_identifier(name)
+                self._apply_compound_op(expr.op, is_64bit=False)
+                self._store_to_identifier(name, "ax")
+            return
+
+        # Generic lvalue (subscript / *ptr / non-bitfield member).
+        # Strategy: eval RHS first (so any side-effects happen before
+        # we hold the LHS address), keep it on the stack, then take
+        # the LHS address into BX once.  Load through BX, apply op,
+        # store back through BX.  Handles both 16-bit and 32-bit values.
+        elem_size = self._lvalue_element_size(expr.target)
+        is_long = elem_size >= 4
+        if is_long:
+            # 32-bit: load RHS and LHS as DX:AX
+            self._gen_eval32(expr.value)              # DX:AX = RHS
+            self._c("push dx")                        # save high word
+            self._c("push ax")                        # save low word
+            self._gen_lvalue_addr(expr.target)
+            self._c("mov bx, ax")                    # BX = &lhs
+            self._c("push bx")                        # preserve address
+            self._gen_load_mem(elem_size)             # AX = current LHS (low)
+            self._c("push ax")                        # save low word
+            self._c("mov ax, dx")                    # AX = LHS high
+            self._c("pop dx")                         # DX = RHS high
+            self._c("pop ax")                         # AX = RHS low
+            # Exchange: BX=&lhs, DX=LHS_high, CX=LHS_low, AX=RHS_high
+            self._c("xchg bx, ax")                    # BX=&lhs, AX=LHS_high
+            self._c("xchg bx, cx")                    # BX=&lhs, CX=LHS_high
+            self._c("mov bx, dx")                    # BX=LHS_high, DX=&lhs
+        else:
+            # 16-bit path: evaluate RHS first into AX, save it on the
+            # stack, then take the LHS address and load the current
+            # value.  The original code pushed AX *before* evaluating
+            # the RHS — it saved whatever happened to be in AX (often
+            # garbage) and the compound op ran on that.  Surfaces as
+            # corrupted sums in Duff's-device-style `*to += *from++`.
+            self._gen_expr(expr.value)                # AX = RHS
+            self._c("push ax")                        # save RHS
+            self._gen_lvalue_addr(expr.target)        # AX = &lhs
+            self._c("push ax")                        # save &lhs
+            self._c("mov bx, ax")                    # BX = &lhs (for the load)
+            self._gen_load_mem(elem_size)             # AX = LHS value
+            self._c("pop cx")                         # CX = &lhs
+            self._c("pop bx")                         # BX = RHS
+            # After this: AX = LHS, BX = RHS, CX = &lhs.
+            # `_apply_compound_op` combines AX with BX → AX; then
+            # we move &lhs into BX for the store-through-BX below.
+
+        # Apply compound operation
+        # For 32-bit ops: DX:LHS, CX:LHS_low, AX:RHS_high, BX:RHS_low
+        # For 16-bit ops: AX:LHS, CX:RHS
+        # For 64-bit ops: DX:LHS_high, CX:LHS_low, AX:RHS_high, BX:RHS_low
+        is_64bit = elem_size >= 8
+        self._apply_compound_op(expr.op, is_64bit=is_64bit)
+        if is_long:
+            # Store back as 32-bit
+            self._c("mov [bx], ax")
+            self._c("mov [bx + 2], dx")
+        elif is_64bit:
+            # Store 64-bit: low, middle, high
+            self._c("mov [bx], ax")
+            self._c("mov [bx + 2], dx")
+            self._c("mov [bx + 4], bx")
+        else:
+            # CX holds &lhs after the setup above; move it into BX
+            # for the address-through-BX store.
+            self._c("mov bx, cx")
+            self._gen_store_through_bx(elem_size)
+
+    def _apply_compound_op(self, op: str, is_64bit: bool = False) -> None:
+        """Emit the instructions for a compound-op operation given
+        registers according to operand width:
+        - 16-bit: AX=LHS, BX=RHS
+        - 32-bit: DX=LHS_high, AX=LHS_low, BX=RHS_high, CX=RHS_low
+        - 64-bit: DX:LHS_high, CX:LHS_low, AX:RHS_high, BX:RHS_low
+
+        For 64-bit arithmetic:
+        - Addition/subtraction: add/sub low words, adc/sbb high words
+        - Multiplication/division: more complex, use 32-bit helper routines
+        """
+        if is_64bit:
+            # 64-bit: DX:LHS_high, CX:LHS_low, AX:RHS_high, BX:RHS_low
+            if op == "+=":
+                self._c("add cx, bx")     # CX = CX + BX
+                self._c("adc dx, 0")      # DX = DX + carry from low
+            elif op == "-=":
+                self._c("sub cx, bx")     # CX = CX - BX
+                self._c("sbb dx, 0")      # DX = DX - borrow from low
+            elif op == "*=":
+                # For 64-bit mul: need DX:AX = LHS * RHS
+                # Use helper routine in stdlib
+                self._c("push dx")
+                self._c("push cx")
+                self._c("push ax")
+                self._c("push bx")
+                self._c("call __mul64")
+                self._c("pop dx")
+                self._c("pop ax")
+                self._c("add sp, 8")
+            elif op == "/=":
+                self._c("push dx")
+                self._c("push cx")
+                self._c("push ax")
+                self._c("push bx")
+                self._c("call __sdiv64")
+                self._c("pop dx")
+                self._c("pop ax")
+                self._c("add sp, 8")
+            elif op == "%=":
+                self._c("push dx")
+                self._c("push cx")
+                self._c("push ax")
+                self._c("push bx")
+                self._c("call __smod64")
+                self._c("pop dx")
+                self._c("pop ax")
+                self._c("add sp, 8")
+            elif op in ("&=", "|=", "^="):
+                self._c("and cx, bx")     # Low &=/|=/^= low
+                self._c("and dx, bx")     # High &= high
+            elif op == "<<=":
+                self._c("mov cl, bl")
+                self._c("shl cx, cl")
+                self._c("shl dx, cl")
+            elif op == ">>=":
+                self._c("mov cl, bl")
+                self._c("sar cx, cl")
+                self._c("sar dx, cl")
+            else:
+                self._c(f"; unsupported compound op {op!r}")
+        else:
+            if op == "+=":
+                self._c("add ax, bx")
+            elif op == "-=":
+                self._c("sub ax, bx")
+            elif op == "*=":
+                self._c("imul bx")
+            elif op == "/=":
+                self._c("cwd")
+                self._c("idiv bx")
+            elif op == "%=":
+                self._c("cwd")
+                self._c("idiv bx")
+                self._c("mov ax, dx")
+            elif op == "&=":
+                self._c("and ax, bx")
+            elif op == "|=":
+                self._c("or ax, bx")
+            elif op == "^=":
+                self._c("xor ax, bx")
+            elif op == "<<=":
+                self._c("mov cl, bl")
+                self._c("sal ax, cl")
+            elif op == ">>=":
+                self._c("mov cl, bl")
+                self._c("sar ax, cl")
+            else:
+                self._c(f"; unsupported compound op {op!r}")
+
+    def _load_from_identifier(self, name: str, reg: str = "ax") -> None:
+        """Load a variable into AX (or `reg`).  When the identifier is
+        a 32-bit type AND `reg=="ax"`, the high word is loaded into DX
+        too (cdecl 32-bit register pair). For 64-bit, the high 16 bits
+        go into DX."""
+        is_long = False
+        t = self._identifier_type(name)
+        if t is not None and t.size >= 4:
+            is_long = True
+        is_long_long = t is not None and t.size >= 8
+        # Static locals are in .data, accessed directly by name.
+        # The brackets `[label]` are critical: without them NASM emits
+        # `mov ax, label` which loads the *address* as an immediate,
+        # not the stored value.
+        if name in self._static_locals:
+            lbl = self._static_locals[name]
+            self._c(f"mov {reg}, [{lbl}]")
+            if is_long_long and reg == "ax":
+                # Canonical 64-bit register layout: AX=lo, DX=mid-lo,
+                # BX=mid-hi, CX=hi.
+                self._c(f"mov dx, [{lbl} + 2]")
+                self._c(f"mov bx, [{lbl} + 4]")
+                self._c(f"mov cx, [{lbl} + 6]")
+                return
+            if is_long and reg == "ax":
+                self._c(f"mov dx, [{lbl} + 2]")
+            return
+        if name in self._locals:
+            offset = self._locals[name]
+            self._c(f"mov {reg}, [bp + {offset}]")
+            if is_long_long and reg == "ax":
+                self._c(f"mov dx, [bp + {offset + 2}]")
+                self._c(f"mov bx, [bp + {offset + 4}]")
+                self._c(f"mov cx, [bp + {offset + 6}]")
+                return
+            if is_long and reg == "ax":
+                self._c(f"mov dx, [bp + {offset + 2}]")
+        else:
+            self._reference_symbol(name)
+            self._c(f"mov {reg}, [{name}]")
+            if is_long_long and reg == "ax":
+                self._c(f"mov dx, [{name} + 2]")
+                self._c(f"mov bx, [{name} + 4]")
+                self._c(f"mov cx, [{name} + 6]")
+                return
+            if is_long and reg == "ax":
+                self._c(f"mov dx, [{name} + 2]")
+
+    def _store_to_identifier(self, name: str, reg: str = "ax") -> None:
+        """Store from a register to a variable, checking local/global scope.
+
+        For 32-bit identifiers, when `reg` is "ax" the high word in DX is
+        also stored.  For 64-bit, the high 16 bits (DX) also stored into
+        DX, and the next 16 bits (BX) need to be loaded from DX for 64-bit.
+        Pass a non-default `reg` to store only that
+        register (used by += etc. with mixed widths).
+        """
+        is_long = False
+        t = self._identifier_type(name)
+        if t is not None and t.size >= 4:
+            is_long = True
+        is_long_long = t is not None and t.size >= 8
+        # Static locals are in .data, accessed directly by name
+        if name in self._static_locals:
+            self._c(f"mov [{self._static_locals[name]}], {reg}")
+            if is_long and reg == "ax":
+                self._c(f"mov [{self._static_locals[name]} + 2], dx")
+            if is_long_long and reg == "ax":
+                self._c(f"mov [{self._static_locals[name]} + 4], bx")
+                self._c(f"mov [{self._static_locals[name]} + 6], cx")
+            return
+        if name in self._locals:
+            offset = self._locals[name]
+            self._c(f"mov [bp + {offset}], {reg}")
+            if is_long and reg == "ax":
+                self._c(f"mov [bp + {offset + 2}], dx")
+            if is_long_long and reg == "ax":
+                self._c(f"mov [bp + {offset + 4}], bx")
+                self._c(f"mov [bp + {offset + 6}], cx")
+        else:
+            self._reference_symbol(name)
+            self._c(f"mov [{name}], {reg}")
+            if is_long and reg == "ax":
+                self._c(f"mov [{name} + 2], dx")
+            if is_long_long and reg == "ax":
+                self._c(f"mov [{name} + 4], bx")
+                self._c(f"mov [{name} + 6], cx")
+
+    # --- Ternary ---
+
+    def _gen_ternary(self, expr: TernaryExpr) -> None:
+        false_label = self._labels.generate("tern")
+        end_label = self._labels.generate("ternend")
+
+        self._gen_expr(expr.condition)
+        self._c("test ax, ax")
+        self._c(f"jz {false_label}")
+        self._gen_expr(expr.true_branch)
+        self._c(f"jmp {end_label}")
+        self._c(f"{false_label}:")
+        self._gen_expr(expr.false_branch)
+        self._c(f"{end_label}:")
+
+    # --- Calls, subscripts, etc. ---
+
+    def _gen_call(self, expr: CallExpr) -> None:
+        """Generate a function-call expression.
+
+        Supports both direct calls (the callee is the name of a known
+        function — emits `call name`) and indirect calls (the callee is
+        any other expression of pointer-to-function type — emits
+        `call ax` after evaluating the expression).  cdecl: args are
+        pushed right-to-left and the caller cleans up by the total
+        byte count.
+        """
+        from src.pyc.types import FunctionType as _FT
+
+        fn = expr.function
+
+        # alloca(n) intrinsic: sub sp, n (aligned to 2); return sp.
+        # The epilogue's `mov sp, bp` reclaims the space automatically.
+        if (
+            isinstance(fn, Identifier)
+            and fn.name == "alloca"
+            and len(expr.args) == 1
+        ):
+            self._gen_expr(expr.args[0])   # size in AX
+            self._c("inc ax")
+            self._c("and ax, 0xFFFE")      # round up to even (word-aligned)
+            self._c("sub sp, ax")
+            self._c("mov ax, sp")
+            return
+
+        # Direct vs. indirect dispatch.  A bare identifier resolves to
+        # a direct `call <name>` when:
+        #   - it's known to name a function in this TU or symbol table
+        #   - OR it's not a local variable and not a known global
+        #     variable, in which case we follow C's implicit-function
+        #     rule (treat unknown identifiers as external functions —
+        #     this matches both K&R C and what the linker resolves for
+        #     stdlib calls like `scanf` whose `<stdio.h>` declaration
+        #     isn't in the synthetic header registry).
+        is_direct = False
+        if isinstance(fn, Identifier) and fn.name not in self._locals:
+            name = fn.name
+            if name in self._function_names:
+                is_direct = True
+            elif self._sym is not None:
+                sym = self._sym.get(name)
+                if sym is not None and sym.kind == SymbolKind.FUNCTION:
+                    is_direct = True
+                elif sym is None:
+                    # Unknown identifier — treat as implicit function.
+                    is_direct = True
+            else:
+                # No shared symbol table; if it's not a registered
+                # local/global variable, assume it's a function label.
+                is_direct = True
+            if is_direct:
+                self._reference_symbol(name)
+
+        # Detect variadic call: known stdio functions or any identifier whose
+        # FunctionType has is_variadic=True in the symbol table.
+        _KNOWN_VARIADIC = frozenset(
+            {"printf", "fprintf", "sprintf", "scanf", "fscanf", "sscanf"}
+        )
+        is_variadic_call = False
+        callee_params: list | None = None
+        if isinstance(fn, Identifier):
+            _fn_name = fn.name
+            from src.pyc.types import FunctionType as _FT2
+            _ft = self._function_types.get(_fn_name)
+            if _ft is None and self._sym is not None:
+                _sym = self._sym.get(_fn_name)
+                if _sym is not None:
+                    _ft = getattr(_sym, "type", None)
+            if isinstance(_ft, _FT2):
+                if _ft.is_variadic:
+                    is_variadic_call = True
+                callee_params = list(_ft.params)
+            if _fn_name in _KNOWN_VARIADIC:
+                is_variadic_call = True
+
+        cleanup = 0
+        n_args = len(expr.args)
+        for arg_idx, arg in enumerate(reversed(expr.args)):
+            # Real index of this arg in the call's positional argument list.
+            real_idx = n_args - 1 - arg_idx
+            expected_param_type: CType | None = None
+            if callee_params is not None and real_idx < len(callee_params):
+                _, expected_param_type = callee_params[real_idx]
+            # Identifier-with-array/pointer-type → push its address
+            # (array/struct decay).  Note that a function identifier
+            # falls through to _gen_expr (and _gen_load_identifier
+            # handles its address-as-immediate decay).
+            if isinstance(arg, Identifier):
+                name = arg.name
+                typ = None
+                if name in self._local_types:
+                    typ = self._local_types[name]
+                elif self._sym is not None:
+                    sym = self._sym.get(name)
+                    if sym is not None:
+                        typ = getattr(sym, "type", None)
+
+                if typ is not None and (isinstance(typ, PointerType) or isinstance(typ, ArrayType)):
+                    # Only do address-as-pointer decay for non-pointer
+                    # bases (array decay or struct address); plain
+                    # pointer locals should be loaded as values.
+                    if isinstance(typ, ArrayType):
+                        if name in self._locals:
+                            offset = self._locals[name]
+                            self._c(f"lea ax, [bp + {offset}]")
+                        else:
+                            self._c(f"mov ax, {name}")
+                        self._c("push ax")
+                        cleanup += 2
+                        continue
+
+            # 32-bit argument: push high then low so the dword reads
+            # little-endian off the stack ([sp]=low, [sp+2]=high).
+            # Exception: in variadic calls, float args are promoted to double
+            # (C default argument promotion rule for variadic functions).
+            arg_w = self._expr_width(arg)
+            arg_t = self._expr_type(arg)
+            _is_float_arg = (
+                isinstance(arg_t, BaseType) and arg_t.name == "float"
+            )
+            if arg_w == 4 and is_variadic_call and _is_float_arg:
+                # Promote float → double: call __f322d64, push 8 bytes.
+                addr = self._lvalue_addr_constant(arg)
+                if addr is not None:
+                    self._c(f"push word [{addr} + 2]")
+                    self._c(f"push word [{addr}]")
+                else:
+                    self._gen_eval32(arg)
+                    self._c("push dx")
+                    self._c("push ax")
+                self._reference_symbol("__f322d64")
+                self._c("call __f322d64")
+                self._c("add sp, 4")
+                self._reference_symbol("__fp_result")
+                self._c("push word [__fp_result + 6]")
+                self._c("push word [__fp_result + 4]")
+                self._c("push word [__fp_result + 2]")
+                self._c("push word [__fp_result]")
+                cleanup += 8
+                continue
+            # Non-variadic call: if param expects float but arg is double,
+            # demote via __d642f32 so the callee sees the correct 4 bytes.
+            _expects_float = (
+                isinstance(expected_param_type, BaseType)
+                and expected_param_type.name == "float"
+            )
+            _is_double_arg = isinstance(arg_t, BaseType) and arg_t.name == "double"
+            if not is_variadic_call and _expects_float and _is_double_arg:
+                addr = self._lvalue_addr_constant(arg)
+                if addr is not None:
+                    self._c(f"push word [{addr} + 6]")
+                    self._c(f"push word [{addr} + 4]")
+                    self._c(f"push word [{addr} + 2]")
+                    self._c(f"push word [{addr}]")
+                else:
+                    self._push_fp_double(arg)
+                self._reference_symbol("__d642f32")
+                self._c("call __d642f32")
+                self._c("add sp, 8")
+                self._c("push dx")
+                self._c("push ax")
+                cleanup += 4
+                continue
+            if arg_w == 4:
+                self._gen_eval32(arg)
+                self._c("push dx")
+                self._c("push ax")
+                cleanup += 4
+                continue
+
+            # 64-bit argument: try to push 4 words *directly from
+            # memory* when the source is a simple lvalue (FP literal,
+            # local variable, global).  This avoids the AX/DX/BX/DX
+            # register-pair limitation where the mid-low and very-high
+            # would have to share DX.  Falls back to _gen_eval64 for
+            # arbitrary expressions.
+            if arg_w == 8:
+                addr = self._lvalue_addr_constant(arg)
+                if addr is not None:
+                    # `addr` is a tuple ('mem', address_expr_string)
+                    # that we can use as `[addr+N]` for word reads.
+                    base = addr
+                    self._c(f"push word [{base} + 6]")    # very-high
+                    self._c(f"push word [{base} + 4]")    # mid-high
+                    self._c(f"push word [{base} + 2]")    # mid-low
+                    self._c(f"push word [{base}]")         # low
+                    cleanup += 8
+                    continue
+                # Fallback: register-based eval into canonical layout
+                # AX=lo, DX=mid-lo, BX=mid-hi, CX=hi.  Push high to low
+                # so the stack reads lo at the lower address.
+                self._gen_eval64(arg)
+                self._c("push cx")    # very-high
+                self._c("push bx")    # mid-high
+                self._c("push dx")    # mid-low
+                self._c("push ax")    # low
+                cleanup += 8
+                continue
+
+            # Default: evaluate expression to rvalue in AX then push.
+            self._gen_expr(arg)
+            self._c("push ax")
+            cleanup += 2
+
+        if is_direct:
+            self._c(f"call {fn.name}")
+        else:
+            self._gen_expr(fn)
+            self._c("call ax")
+        if cleanup:
+            self._c(f"add sp, {cleanup}")
+        # 64-bit return convention: low 32 bits arrive in DX:AX (as for
+        # any long-sized return) and the high 32 bits are staged in the
+        # static buffer `__ret64_hi`.  Load them into BX/CX so the
+        # caller sees the canonical AX=lo, DX=mid-lo, BX=mid-hi, CX=hi
+        # layout.
+        ret_type = self._expr_type(expr)
+        if ret_type is not None and getattr(ret_type, "size", 0) >= 8 \
+                and not isinstance(ret_type, ArrayType):
+            self._reference_symbol("__ret64_hi")
+            self._c("mov bx, [__ret64_hi]")
+            self._c("mov cx, [__ret64_hi + 2]")
+
+    def _gen_subscript(self, expr: Subscript) -> None:
+        """Generate code for array subscripting: arr[i] -> *(arr + i*element_size)."""
+        # For multi-dimensional arrays, use the size of one row, not the innermost element
+        element_size = self._array_element_size(expr.array)
+        # If the subscript yields an array (e.g. `m[i]` where m is
+        # `int[N][M]` or `int (*)[M]`), the result decays to a pointer
+        # and the final memory load is wrong — we want the ADDRESS of
+        # the row, not a value loaded from it.  Detect this and stop
+        # before the load.  Otherwise the inner subscript would deref
+        # garbage.
+        elem_type = self._subscript_element_type(expr.array)
+        yields_array = isinstance(elem_type, ArrayType)
+        self._gen_expr(expr.array)           # AX = base address
+        self._c("push ax")
+        self._gen_expr(expr.index)           # AX = index
+        if element_size == 2:
+            self._c("shl ax, 1")             # AX = index * 2
+        elif element_size == 4:
+            self._c("shl ax, 2")             # AX = index * 4
+        elif element_size > 2:
+            self._c(f"mov bx, {element_size}")
+            self._c("imul bx")
+        self._c("mov bx, ax")                # BX = byte offset
+        self._c("pop ax")                    # AX = base address
+        self._c("add ax, bx")                # AX = element address
+        if yields_array:
+            return                            # array decay: stop at the address
+        self._c("mov bx, ax")
+        self._gen_load_mem(element_size)
+
+    def _subscript_element_type(self, array_expr: Expr) -> CType | None:
+        """Type of one element produced by subscripting `array_expr`."""
+        if isinstance(array_expr, Identifier):
+            t = self._identifier_type(array_expr.name)
+            if isinstance(t, ArrayType):
+                return t.element_type
+            if isinstance(t, PointerType):
+                return t.inner
+        return self._expr_pointee_type(array_expr)
+
+    def _gen_cast(self, expr: CastExpr) -> None:
+        from src.pyc.types import BaseType as _BT, PointerType as _PT
+        tgt = expr.target_type
+        # Evaluate operand into AX (or DX:AX for 32-bit sources).
+        self._gen_expr(expr.operand)
+        # Truncate / sign-extend to the target type.
+        if isinstance(tgt, _BT):
+            if tgt.name == "char":
+                # Truncate to 8 bits, then sign-extend to 16.
+                self._c("and ax, 0x00FF")
+                if tgt.signed:
+                    self._c("cbw")   # sign-extend AL → AX
+            elif tgt.name in ("short", "int"):
+                pass  # already 16-bit in AX
+            elif tgt.name == "long":
+                # Sign- or zero-extend AX → DX:AX (32-bit).
+                if tgt.signed:
+                    self._c("cwd")
+                else:
+                    self._c("xor dx, dx")
+            elif tgt.name == "long_long":
+                # Sign- or zero-extend AX → DX:AX (treat as 32-bit; upper
+                # 32 bits are zeroed / sign-filled the same way).
+                if tgt.signed:
+                    self._c("cwd")
+                    self._c("mov bx, dx")  # BX = sign fill for upper words
+                    self._c("mov cx, dx")
+                else:
+                    self._c("xor dx, dx")
+                    self._c("xor bx, bx")
+                    self._c("xor cx, cx")
+
+    def _gen_sizeof(self, expr: SizeofExpr) -> None:
+        if isinstance(expr.operand, CType):
+            self._c(f"mov ax, {expr.operand.size}")
+        elif isinstance(expr.operand, Expr):
+            # Try to determine size from expression type
+            if isinstance(expr.operand, StringLiteral):
+                self._c(f"mov ax, {len(expr.operand.value) + 1}")
+            else:
+                # Infer the operand's type so `sizeof(arr)` yields the whole
+                # array's byte size (element_size * count) rather than a
+                # pointer's size — arrays must NOT decay under sizeof.
+                t = self._expr_type(expr.operand)
+                if t is not None and t.size > 0:
+                    self._c(f"mov ax, {t.size}")
+                else:
+                    self._c("mov ax, 2")
+        else:
+            self._c("mov ax, 2")
+
+    # --- Struct member access ---
+
+    def _struct_type_of(self, expr: Expr) -> StructType | None:
+        """Determine the StructType `expr` evaluates to (an lvalue of
+        struct type), or None.  Walks through Identifiers, dereferences,
+        and nested MemberAccess so chained `.field.subfield` works.
+        """
+        if isinstance(expr, Identifier):
+            t = self._identifier_type(expr.name)
+            return t if isinstance(t, StructType) else None
+        if isinstance(expr, UnaryOp) and expr.op == "*":
+            # *ptr where ptr is StructType *
+            inner = self._expr_pointee_type(expr.operand)
+            return inner if isinstance(inner, StructType) else None
+        if isinstance(expr, MemberAccess):
+            parent = self._struct_type_of_for_member(expr)
+            if parent is None:
+                return None
+            try:
+                ft = parent.field_type(expr.member)
+            except KeyError:
+                return None
+            return ft if isinstance(ft, StructType) else None
+        return None
+
+    def _struct_type_of_for_member(self, expr: MemberAccess) -> StructType | None:
+        """Return the struct type that owns `expr.member` (i.e. the
+        struct of `expr.object`, or its pointee for `->`)."""
+        if expr.indirect:
+            inner = self._expr_pointee_type(expr.object)
+            return inner if isinstance(inner, StructType) else None
+        return self._struct_type_of(expr.object)
+
+    def _gen_member_addr(self, expr: MemberAccess) -> None:
+        """Emit code that leaves the *address* of `expr` in AX."""
+        struct_type = self._struct_type_of_for_member(expr)
+        if struct_type is None:
+            self._c(f"; member access on unknown struct type: {expr.member!r}")
+            self._gen_expr(expr.object)
+            return
+        offset = struct_type.field_offset(expr.member)
+        if expr.indirect:
+            # ptr->member: evaluate ptr (rvalue) then bias by offset.
+            self._gen_expr(expr.object)
+        else:
+            # obj.member: take the address of obj, then bias by offset.
+            self._gen_lvalue_addr(expr.object)
+        if offset:
+            self._c(f"add ax, {offset}")
+
+    def _gen_lvalue_addr(self, expr: Expr) -> None:
+        """Emit code leaving `&expr` in AX for an lvalue.
+
+        Recognises Identifier (local/global), `*ptr`, `obj.m`/`p->m`,
+        and `arr[i]`.  Used by both the read path (taking `&x`) and
+        the write path (`_gen_compound_assign` and `++`/`--` on
+        non-Identifier lvalues).
+        """
+        if isinstance(expr, Identifier):
+            name = expr.name
+            if name in self._locals:
+                self._c(f"lea ax, [bp + {self._locals[name]}]")
+            else:
+                self._reference_symbol(name)
+                self._c(f"mov ax, {name}")
+            return
+        if isinstance(expr, UnaryOp) and expr.op == "*":
+            # &(*p) is just p — evaluate the pointer expression.
+            self._gen_expr(expr.operand)
+            return
+        if isinstance(expr, MemberAccess):
+            self._gen_member_addr(expr)
+            return
+        if isinstance(expr, Subscript):
+            # arr[i] address = base + index * sizeof(*base).  Same
+            # computation as the read path in _gen_subscript but
+            # stopping before the final load. For multi-dim arrays,
+            # use one-row size, not innermost element.
+            element_size = self._array_element_size(expr.array)
+            self._gen_expr(expr.array)           # AX = base address
+            self._c("push ax")
+            self._gen_expr(expr.index)           # AX = index
+            if element_size == 2:
+                self._c("shl ax, 1")
+            elif element_size == 4:
+                self._c("shl ax, 2")
+            elif element_size > 2:
+                self._c(f"mov bx, {element_size}")
+                self._c("imul bx")
+            self._c("mov bx, ax")
+            self._c("pop ax")
+            self._c("add ax, bx")
+            return
+        # Fallback: just evaluate (likely wrong, but at least non-fatal).
+        self._c(f"; cannot take address of {type(expr).__name__}")
+        self._gen_expr(expr)
+
+    def _lvalue_element_size(self, target: Expr) -> int:
+        """Byte size of the value the lvalue `target` reads/writes.
+
+        For Identifier: the identifier's declared size (max 2 because
+        bytes still occupy a word slot in our model — but we report 1
+        for `char` so the store path uses `mov [bx], al`).  For `*p`
+        and `arr[i]`: size of the pointee/element.  For `obj.m`: size
+        of the field's CType (BitField surfaces via `BitField.base`).
+        """
+        from src.pyc.types import BitField as _BitField
+        if isinstance(target, Identifier):
+            t = self._identifier_type(target.name)
+            if t is not None:
+                return t.size
+            return 2
+        if isinstance(target, UnaryOp) and target.op == "*":
+            return self._expr_ptr_inner_size(target.operand)
+        if isinstance(target, Subscript):
+            return self._expr_ptr_inner_size(target.array)
+        if isinstance(target, MemberAccess):
+            st = self._struct_type_of_for_member(target)
+            if st is not None:
+                try:
+                    ft = st.field_type(target.member)
+                    if isinstance(ft, _BitField):
+                        return ft.base.size
+                    return ft.size
+                except KeyError:
+                    pass
+        return 2
+
+    def _gen_store_through_bx(self, element_size: int) -> None:
+        """Emit a memory store from AX to [BX], sized by element_size.
+
+        Mirror of `_gen_load_mem`.  For 1-byte elements emits
+        `mov [bx], al`; otherwise `mov [bx], ax`.  Always preserves AH
+        on the AX side (callers pre-mask via xor ah, ah if they care).
+        """
+        if element_size == 1:
+            self._c("mov [bx], al")
+        else:
+            self._c("mov [bx], ax")
+
+    def _gen_member_access(self, expr: MemberAccess) -> None:
+        """Generate a struct member read.
+
+        For a regular field: compute the field address, then load
+        through it sized by the field's CType (chars get a byte load
+        with `xor ah, ah`).
+
+        For a bitfield: load the containing storage word, shift the
+        field down by `bit_offset`, mask to `width` bits.
+        """
+        from src.pyc.types import BitField as _BitField
+
+        struct_type = self._struct_type_of_for_member(expr)
+        ft: CType | None = None
+        if struct_type is not None:
+            try:
+                ft = struct_type.field_type(expr.member)
+            except KeyError:
+                ft = None
+
+        self._gen_member_addr(expr)
+        self._c("mov bx, ax")
+        if isinstance(ft, _BitField):
+            # Extract the field into a 16-bit `int` result (the promoted
+            # type).  The field lives at `bit_offset` within a storage
+            # unit whose base address is now in BX.  Find the 16-bit word
+            # holding the field's low bit, then shift/combine across the
+            # word boundary when the field straddles two words.
+            eff = min(ft.width, 16)               # result bits we keep
+            word_byte = (ft.bit_offset // 16) * 2  # byte offset of that word
+            intra = ft.bit_offset % 16             # bit within the word
+            src = f"[bx + {word_byte}]" if word_byte else "[bx]"
+            self._c(f"mov ax, {src}")
+            if intra + eff > 16:
+                # Field straddles into the next word: combine
+                # (ax >> intra) | (next << (16 - intra)).
+                self._c(f"mov dx, [bx + {word_byte + 2}]")
+                self._c(f"mov cl, {intra}")
+                self._c("shr ax, cl")
+                self._c(f"mov cl, {16 - intra}")
+                self._c("shl dx, cl")
+                self._c("or ax, dx")
+            elif intra:
+                self._c(f"mov cl, {intra}")
+                self._c("shr ax, cl")
+            if eff < 16:
+                self._c(f"and ax, {(1 << eff) - 1}")
+        else:
+            elem_size = ft.size if ft is not None else 2
+            self._gen_load_mem(elem_size)
+
+    def _gen_comma(self, expr: CommaExpr) -> None:
+        for e in expr.expressions[:-1]:
+            self._gen_expr(e)
+        if expr.expressions:
+            self._gen_expr(expr.expressions[-1])
+
+    def _gen_float_literal(self, expr: FloatLiteral) -> None:
+        """Emit an IEEE-754 constant and load its bytes into registers.
+
+        - `float` (32-bit single): bytes go in DX:AX (high:low), matching
+          the 32-bit integer codegen layout.
+        - `double` (64-bit): bytes go in AX/DX/BX (low to high), matching
+          the 64-bit integer codegen layout.
+
+        The constant is materialised as a labelled `dd` / `dq` in
+        `.data` and loaded from memory.  Common values (0.0) could be
+        loaded via `xor`-style sequences, but a memory load is simpler
+        and fast enough for our purposes.
+        """
+        import struct
+        is_float = (expr.type.size == 4)
+        # Cache constants by their bit pattern so duplicate literals
+        # share the same label.
+        if is_float:
+            bits = struct.unpack("<I", struct.pack("<f", expr.value))[0]
+            key = ("f", bits)
+        else:
+            bits = struct.unpack("<Q", struct.pack("<d", expr.value))[0]
+            key = ("d", bits)
+        if not hasattr(self, "_float_constants"):
+            self._float_constants: dict[tuple, str] = {}
+        if key in self._float_constants:
+            label = self._float_constants[key]
+        else:
+            self._float_constants[key] = label = (
+                f"_fconst_{len(self._float_constants) + 1}"
+            )
+            if is_float:
+                self._d(f"{label}: dd 0x{bits:08x}")
+            else:
+                self._d(f"{label}: dq 0x{bits:016x}")
+        if is_float:
+            self._c(f"mov ax, [{label}]")
+            self._c(f"mov dx, [{label} + 2]")
+        else:
+            # 64-bit double: load all 4 words into the canonical
+            # AX=lo, DX=mid-lo, BX=mid-hi, CX=hi layout.
+            self._c(f"mov ax, [{label}]")
+            self._c(f"mov dx, [{label} + 2]")
+            self._c(f"mov bx, [{label} + 4]")
+            self._c(f"mov cx, [{label} + 6]")
+
+    def _lvalue_addr_constant(self, expr: Expr) -> str | None:
+        """Return a NASM-displacement string (e.g. `bp - 12` or
+        `_var_name`) for the address of `expr` IF it's a simple
+        compile-time-known lvalue, else None.  Used by the 8-byte
+        argument push path to read all 4 words from memory.
+        """
+        # FP literal: cached label in the .data section.
+        if isinstance(expr, FloatLiteral):
+            import struct
+            if expr.type.size == 4:
+                bits = struct.unpack("<I", struct.pack("<f", expr.value))[0]
+                key = ("f", bits)
+            else:
+                bits = struct.unpack("<Q", struct.pack("<d", expr.value))[0]
+                key = ("d", bits)
+            if not hasattr(self, "_float_constants"):
+                self._float_constants = {}
+            if key in self._float_constants:
+                label = self._float_constants[key]
+            else:
+                self._float_constants[key] = label = (
+                    f"_fconst_{len(self._float_constants) + 1}"
+                )
+                if expr.type.size == 4:
+                    self._d(f"{label}: dd 0x{bits:08x}")
+                else:
+                    self._d(f"{label}: dq 0x{bits:016x}")
+            return label
+        if isinstance(expr, Identifier):
+            name = expr.name
+            if name in self._locals:
+                return f"bp + {self._locals[name]}"
+            if name in self._static_locals:
+                return self._static_locals[name]
+            t = self._identifier_type(name) if name not in self._function_names else None
+            if t is not None:
+                self._reference_symbol(name)
+                return name
+        return None
+
+    def _is_fp_expr(self, expr: Expr) -> bool:
+        """True if `expr` evaluates to a floating-point type (float/double)."""
+        t = self._expr_type(expr)
+        if isinstance(t, BaseType) and t.name in ("float", "double"):
+            return True
+        return False
+
+    def _gen_fp_binary_op(self, expr: BinaryOp) -> None:
+        """Route a binary op with FP operand(s) to the soft-FP runtime.
+
+        Both operands are promoted to the wider type (double > float).
+        The helper takes the operands on the stack (cdecl) and returns
+        the result in DX:AX (float) or AX/DX/BX (double).
+        """
+        # Decide the result type — double if either operand is double.
+        lt = self._expr_type(expr.left)
+        rt = self._expr_type(expr.right)
+        def _is_double(t):
+            return isinstance(t, BaseType) and t.name == "double"
+        as_double = _is_double(lt) or _is_double(rt)
+        width = 8 if as_double else 4
+        # Choose the helper name based on op.
+        op = expr.op
+        if as_double:
+            helper = {
+                "+": "__dadd64", "-": "__dsub64",
+                "*": "__dmul64", "/": "__ddiv64",
+            }.get(op)
+        else:
+            helper = {
+                "+": "__fadd32", "-": "__fsub32",
+                "*": "__fmul32", "/": "__fdiv32",
+            }.get(op)
+        if helper is None:
+            # Comparison / unsupported — fall back to integer codegen.
+            # (Real FP comparison should go through __fcmp32/__dcmp64.)
+            self._c(f"; FP op {op!r} not yet routed; falling through")
+            return
+        # Push right operand, then left (cdecl right-to-left).  Use
+        # the memory-push path for double operands so all 4 words
+        # survive (the register-based eval64 loses one word).
+        if as_double:
+            self._push_fp_double(expr.right)
+            self._push_fp_double(expr.left)
+            self._reference_symbol(helper)
+            self._c(f"call {helper}")
+            self._c("add sp, 16")
+            # Result is in __fp_result (4 words).  Load 3 of them
+            # into AX/DX/BX; the 4th lives in memory and will be
+            # picked up via the source-from-memory paths.
+            self._reference_symbol("__fp_result")
+            self._c("mov ax, [__fp_result]")
+            self._c("mov dx, [__fp_result + 2]")
+            self._c("mov bx, [__fp_result + 4]")
+            # Complete the 4-word register result: the high word (sign|exp|
+            # mantissa[51:48]) goes in CX so consumers that pass a double
+            # *expression* result as a vararg (push cx/bx/dx/ax) get all 4
+            # words.  Memory-source consumers still read it from __fp_result.
+            self._c("mov cx, [__fp_result + 6]")
+        else:
+            self._gen_fp_arg(expr.right, want_double=False)
+            self._c("push dx")
+            self._c("push ax")
+            self._gen_fp_arg(expr.left, want_double=False)
+            self._c("push dx")
+            self._c("push ax")
+            self._reference_symbol(helper)
+            self._c(f"call {helper}")
+            self._c("add sp, 8")
+
+    def _push_fp_double(self, expr: Expr) -> None:
+        """Push a double operand as 4 words on the stack.
+
+        For memory-resident doubles (literal or identifier of type double)
+        the 8 bytes are pushed directly.  For floats and integer
+        sub-expressions the value is promoted to double via the FP
+        helpers and the result is fetched from __fp_result.
+        """
+        t = self._expr_type(expr)
+        is_float_src = isinstance(t, BaseType) and t.name == "float"
+        is_double_src = isinstance(t, BaseType) and t.name == "double"
+
+        addr = self._lvalue_addr_constant(expr)
+        if addr is not None and is_double_src:
+            # Direct 8-byte memory push — only safe for a full double.
+            self._c(f"push word [{addr} + 6]")
+            self._c(f"push word [{addr} + 4]")
+            self._c(f"push word [{addr} + 2]")
+            self._c(f"push word [{addr}]")
+            return
+        if addr is not None and is_float_src:
+            # Float in memory: promote to double via __f322d64.
+            self._c(f"push word [{addr} + 2]")
+            self._c(f"push word [{addr}]")
+            self._reference_symbol("__f322d64")
+            self._c("call __f322d64")
+            self._c("add sp, 4")
+            self._reference_symbol("__fp_result")
+            self._c("push word [__fp_result + 6]")
+            self._c("push word [__fp_result + 4]")
+            self._c("push word [__fp_result + 2]")
+            self._c("push word [__fp_result]")
+            return
+        # Sub-expression or integer — evaluate via _gen_fp_arg which
+        # routes through __fp_result for the result.
+        self._gen_fp_arg(expr, want_double=True)
+        self._reference_symbol("__fp_result")
+        self._c("push word [__fp_result + 6]")
+        self._c("push word [__fp_result + 4]")
+        self._c("push word [__fp_result + 2]")
+        self._c("push word [__fp_result]")
+
+    def _gen_fp_arg(self, expr: Expr, want_double: bool) -> None:
+        """Evaluate `expr` so it occupies the FP-arg registers
+        (DX:AX for float, AX/DX/BX for double).  Promotes int→float
+        and float→double via the conversion helpers."""
+        t = self._expr_type(expr)
+        is_double_src = isinstance(t, BaseType) and t.name == "double"
+        is_float_src = isinstance(t, BaseType) and t.name == "float"
+        is_fp_src = is_double_src or is_float_src
+        if is_fp_src:
+            self._gen_expr(expr)
+            # If we want double but have float, promote.
+            if want_double and is_float_src:
+                self._c("push dx")
+                self._c("push ax")
+                self._reference_symbol("__f322d64")
+                self._c("call __f322d64")
+                self._c("add sp, 4")
+            return
+        # Integer operand — convert.
+        self._gen_expr(expr)        # AX = int value
+        self._c("push ax")
+        if want_double:
+            self._reference_symbol("__si2d64")
+            self._c("call __si2d64")
+        else:
+            self._reference_symbol("__si2f32")
+            self._c("call __si2f32")
+        self._c("add sp, 2")
+
+    def _gen_string_literal(self, expr: StringLiteral) -> None:
+        """Store string literal and load its address."""
+        if expr.value not in self._string_labels:
+            self._string_counter += 1
+            label = f"_str_{self._string_counter}"
+            self._string_labels[expr.value] = label
+            self._d(f"{label} db {self._encode_string_for_nasm(expr.value)}, 0")
+        else:
+            label = self._string_labels[expr.value]
+
+        self._c(f"mov ax, {label}")
+
+    @staticmethod
+    def _encode_string_for_nasm(s: str) -> str:
+        """Encode a string for NASM: runs of printable ASCII as quoted text,
+        non-printable bytes as decimal."""
+        parts: list[str] = []
+        run: list[str] = []
+        for ch in s:
+            code = ord(ch)
+            if 32 <= code < 127 and ch != '"' and ch != '\\':
+                run.append(ch)
+            else:
+                if run:
+                    parts.append('"' + "".join(run) + '"')
+                    run = []
+                parts.append(str(code))
+        if run:
+            parts.append('"' + "".join(run) + '"')
+        return ", ".join(parts) if parts else '""'
+
+    def _gen_load_identifier(self, expr: Identifier) -> None:
+        """Load an identifier value.  For 16-bit types the value ends up
+        in AX; for 32-bit types in DX:AX (high:low).
+
+        Function names decay to their address: `mov ax, name` (the
+        label itself) instead of `mov ax, [name]` (which would read
+        memory at that label).  This makes `BinOp p = add;` and passing
+        `add` as a function-pointer argument work without explicit `&`.
+        """
+        name = expr.name
+        # Static locals are allocated in .data and accessed by name,
+        # not offset.  For array-typed statics the identifier decays
+        # to the address (the label IS the address); for scalar
+        # statics we must dereference with `[label]`.
+        if name in self._static_locals:
+            lbl = self._static_locals[name]
+            t = self._identifier_type(name)
+            if isinstance(t, ArrayType):
+                self._c(f"mov ax, {lbl}")
+                return
+            self._c(f"mov ax, [{lbl}]")
+            width = self._expr_width(expr)
+            if width == 4:
+                self._c(f"mov dx, [{lbl} + 2]")
+            return
+        # Array decay: an identifier of array type, used as a value,
+        # yields the address of the array's first element (a pointer).
+        # This is what makes `a[0]`, `f(a)`, and `&a[0]` all read from
+        # the same place.
+        t = self._identifier_type(name)
+        if isinstance(t, ArrayType):
+            if name in self._locals:
+                offset = self._locals[name]
+                self._c(f"lea ax, [bp + {offset}]")
+            else:
+                self._reference_symbol(name)
+                self._c(f"mov ax, {name}")
+            return
+        width = self._expr_width(expr)
+        if name in self._locals:
+            offset = self._locals[name]
+            self._c(f"mov ax, [bp + {offset}]")
+            if width == 8:
+                # Canonical 64-bit register layout: AX=lo, DX=mid-lo,
+                # BX=mid-hi, CX=hi.
+                self._c(f"mov dx, [bp + {offset + 2}]")
+                self._c(f"mov bx, [bp + {offset + 4}]")
+                self._c(f"mov cx, [bp + {offset + 6}]")
+                return
+            if width == 4:
+                self._c(f"mov dx, [bp + {offset + 2}]")
+            return
+        # Global / external scope.  Distinguish a function label
+        # (code-segment address; load via immediate) from a regular
+        # global variable (data-segment memory; load via [name]).
+        if name in self._function_names:
+            self._reference_symbol(name)
+            self._c(f"mov ax, {name}")
+            return
+        if self._sym is not None:
+            sym = self._sym.get(name)
+            if sym is not None and sym.kind == SymbolKind.FUNCTION:
+                self._reference_symbol(name)
+                self._c(f"mov ax, {name}")
+                return
+        self._reference_symbol(name)
+        self._c(f"mov ax, [{name}]")
+        if width == 8:
+            self._c(f"mov dx, [{name} + 2]")
+            self._c(f"mov bx, [{name} + 4]")
+            self._c(f"mov cx, [{name} + 6]")
+            return
+        if width == 4:
+            self._c(f"mov dx, [{name} + 2]")

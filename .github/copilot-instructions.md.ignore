@@ -1,0 +1,10 @@
+# copilot-instructions.md
+
+Always continue until:
+- tests pass
+- lint passes
+- feature is fully wired end-to-end
+
+Do not stop after partial implementation.
+Do not ask for confirmation between subtasks.
+Prefer making a full working draft before requesting feedback.

@@ -1,0 +1,10 @@
+[project]
+name = "pyc"
+version = "0.1.0"
+description = "Minimal C compiler generating 16-bit NASM assembly for DOS .EXE"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-cov"]
